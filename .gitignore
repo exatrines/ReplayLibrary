@@ -1,0 +1,19 @@
+## Build
+**/bin/
+**/obj/
+*.user
+*.suo
+.vs/
+artifacts/
+.cursor/
+
+## Access service
+server/
+
+## Local plugins
+ReplayConverterSrc/
+
+## OS
+Thumbs.db
+Desktop.ini
+.DS_Store
