@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-09
+
+### Replay Converter
+
+- Sign in by pasting the code from the Discord `/auth` command. A saved sign-in still lasts 7 days and renews automatically.
+
 ## [0.1.0] - 2026-11-08
 
 ### Replay Library
