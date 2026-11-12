@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using Lumina.Excel.Sheets;
 
 namespace ReplayLibrary.Library;
@@ -20,7 +21,20 @@ internal static class Catalog
         bool Cleared,
         bool Protected);
 
+    private static readonly object FileGate = new();
+    private static readonly Dictionary<uint, (uint Type, uint Patch)?> PlacementCache = new();
     private static long _nextMaintainUnix;
+    private static int _maintainBusy;
+    private static int _maintainAgain;
+    private static MaintainScan? _maintainScan;
+
+    private sealed class MaintainScan
+    {
+        internal required List<StoredReplay> Stored { get; init; }
+        internal required List<DeletedFile> Deleted { get; init; }
+    }
+
+    private readonly record struct DeletedFile(string Path, DateTime Arrived, long Length);
 
     internal static IReadOnlyList<Entry> List(uint preferredBuild)
     {
@@ -38,7 +52,7 @@ internal static class Catalog
 
         foreach (var file in Directory.EnumerateFiles(root, "*.dat", SearchOption.AllDirectories))
         {
-            if (IsConvertedSibling(file) || IsSplitFile(file))
+            if (IsLegacyPart(file) || IsSplitFile(file))
                 continue;
 
             var directoryName = Path.GetFileName(Path.GetDirectoryName(file)) ?? string.Empty;
@@ -232,11 +246,14 @@ internal static class Catalog
         return new LookedUpContent(row.Value.Name.ToString(), row.Value.ContentType.RowId);
     }
 
-    internal static bool IsInLibrary(string path)
+    internal static bool IsInLibrary(string path) =>
+        IsInside(path, ReplayPaths.LibraryDirectory());
+
+    private static bool IsInside(string path, string root)
     {
-        var library = Path.GetFullPath(ReplayPaths.LibraryDirectory());
+        var folder = Path.GetFullPath(root);
         var full = Path.GetFullPath(path);
-        return full.StartsWith(library + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        return full.StartsWith(folder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     internal static string? FindOriginal(uint sourceBuild, uint timestamp, uint contentId)
@@ -290,10 +307,12 @@ internal static class Catalog
             var target = NextFreePath(destination, Path.GetFileNameWithoutExtension(file));
             try
             {
-                File.Move(file, target);
-                var meta = Path.ChangeExtension(file, ".json");
-                if (File.Exists(meta))
-                    File.Move(meta, Path.ChangeExtension(target, ".json"), overwrite: true);
+                lock (FileGate)
+                {
+                    File.Move(file, target);
+                    MoveSidecar(file, target, clearDestination: false);
+                }
+
                 moved = true;
             }
             catch (Exception e)
@@ -331,7 +350,8 @@ internal static class Catalog
         var destination = NextFreePath(folder, fileName);
         try
         {
-            File.Move(sourcePath, destination);
+            lock (FileGate)
+                File.Move(sourcePath, destination);
         }
         catch (Exception e)
         {
@@ -369,7 +389,7 @@ internal static class Catalog
 
         foreach (var file in Directory.EnumerateFiles(root, "*.dat", SearchOption.AllDirectories))
         {
-            if (SamePath(file, sourcePath) || IsConvertedSibling(file))
+            if (SamePath(file, sourcePath) || IsLegacyPart(file))
                 continue;
             if (!ReplayFile.TryRead(file, out var existing))
                 continue;
@@ -420,9 +440,7 @@ internal static class Catalog
         try
         {
             File.Delete(sourcePath);
-            var meta = Path.ChangeExtension(sourcePath, ".json");
-            if (File.Exists(meta))
-                File.Delete(meta);
+            DeleteSidecar(sourcePath);
         }
         catch (Exception e)
         {
@@ -430,7 +448,7 @@ internal static class Catalog
         }
     }
 
-    private readonly record struct StoredReplay(string Path, ReplayFile.Header Header, bool Anonymized);
+    private readonly record struct StoredReplay(string Path, ReplayFile.Header Header);
 
     private static List<StoredReplay> ReadStored(string root)
     {
@@ -440,10 +458,10 @@ internal static class Catalog
 
         foreach (var file in Directory.EnumerateFiles(root, "*.dat", SearchOption.AllDirectories))
         {
-            if (IsConvertedSibling(file) || IsSplitFile(file) || !ReplayFile.TryRead(file, out var header))
+            if (IsLegacyPart(file) || IsSplitFile(file) || !ReplayFile.TryRead(file, out var header))
                 continue;
 
-            files.Add(new StoredReplay(file, header, ReadFileMark(file).Anonymized));
+            files.Add(new StoredReplay(file, header));
         }
 
         return files;
@@ -455,16 +473,18 @@ internal static class Catalog
         Directory.CreateDirectory(deleted);
 
         var count = 0;
-        var kept = KeptPaths();
         foreach (var path in paths)
         {
-            if (!IsInLibrary(path) || kept.Contains(Path.GetFullPath(path)))
+            if (!IsInLibrary(path))
                 continue;
 
             try
             {
-                if (MoveToDeleted(path, deleted))
-                    count++;
+                lock (FileGate)
+                {
+                    if (MoveToDeleted(path, deleted))
+                        count++;
+                }
             }
             catch (Exception e)
             {
@@ -472,7 +492,6 @@ internal static class Catalog
             }
         }
 
-        TrimDeleted();
         return count;
     }
 
@@ -491,12 +510,7 @@ internal static class Catalog
         File.Move(path, destination);
         RemoveSplitParts(path);
         File.SetCreationTimeUtc(destination, DateTime.UtcNow);
-        var meta = Path.ChangeExtension(path, ".json");
-        var metaDestination = Path.ChangeExtension(destination, ".json");
-        if (File.Exists(meta))
-            File.Move(meta, metaDestination, overwrite: true);
-        else if (File.Exists(metaDestination))
-            File.Delete(metaDestination);
+        MoveSidecar(path, destination, clearDestination: true);
         return true;
     }
 
@@ -509,12 +523,8 @@ internal static class Catalog
             removed = true;
         }
 
-        var meta = Path.ChangeExtension(path, ".json");
-        if (File.Exists(meta))
-        {
-            File.Delete(meta);
+        if (DeleteSidecar(path))
             removed = true;
-        }
 
         if (removed)
             RemoveSplitParts(path);
@@ -522,45 +532,127 @@ internal static class Catalog
         return removed;
     }
 
+    private static void MoveSidecar(string source, string destination, bool clearDestination)
+    {
+        var meta = Path.ChangeExtension(source, ".json");
+        var target = Path.ChangeExtension(destination, ".json");
+        if (File.Exists(meta))
+            File.Move(meta, target, overwrite: true);
+        else if (clearDestination && File.Exists(target))
+            File.Delete(target);
+    }
+
+    private static bool DeleteSidecar(string path)
+    {
+        var meta = Path.ChangeExtension(path, ".json");
+        if (!File.Exists(meta))
+            return false;
+
+        File.Delete(meta);
+        return true;
+    }
+
     internal static bool MaintainLibrary(bool force = false)
     {
+        var changed = false;
+        MaintainScan? scan;
+        lock (FileGate)
+        {
+            scan = _maintainScan;
+            _maintainScan = null;
+        }
+
+        if (scan != null)
+        {
+            if (!ReplayBackup.CanMutateReplay())
+            {
+                lock (FileGate)
+                    _maintainScan ??= scan;
+            }
+            else
+            {
+                changed = ArchiveAgedReplays(scan.Stored);
+                if (TrimDeleted(scan.Deleted))
+                    changed = true;
+            }
+        }
+
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        if (!force && now < _nextMaintainUnix)
-            return false;
+        if (!force && now < Volatile.Read(ref _nextMaintainUnix))
+            return changed;
 
         if (!ReplayBackup.CanMutateReplay())
-            return false;
+            return changed;
 
-        _nextMaintainUnix = now + 60;
-        var changed = ArchiveAgedReplays();
-        if (TrimDeleted())
-            changed = true;
+        if (Interlocked.CompareExchange(ref _maintainBusy, 1, 0) != 0)
+        {
+            if (force)
+                Volatile.Write(ref _maintainAgain, 1);
+            return changed;
+        }
+
+        Volatile.Write(ref _nextMaintainUnix, now + 60);
+        Task.Run(ScanLibrary);
         return changed;
     }
 
-    private static bool ArchiveAgedReplays()
+    private static void ScanLibrary()
+    {
+        try
+        {
+            var scan = new MaintainScan
+            {
+                Stored = DeletableFiles(),
+                Deleted = ReadDeleted(),
+            };
+            lock (FileGate)
+                _maintainScan = scan;
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Error(e, "Failed to read the library");
+        }
+        finally
+        {
+            Volatile.Write(ref _maintainBusy, 0);
+            if (Interlocked.Exchange(ref _maintainAgain, 0) == 1)
+                Volatile.Write(ref _nextMaintainUnix, 0);
+        }
+    }
+
+    private static bool ArchiveAgedReplays(List<StoredReplay> stored)
     {
         var days = C.DeletedKeepDays;
         if (days <= 0)
             return false;
 
         var cutoff = DateTimeOffset.UtcNow.AddDays(-days).ToUnixTimeSeconds();
-        var stored = DeletableFiles();
-        var kept = KeptPaths(stored);
+        var library = new List<StoredReplay>();
+        foreach (var file in stored)
+        {
+            if (IsInLibrary(file.Path))
+                library.Add(file);
+        }
+
+        var kept = KeptPaths(library);
         var deleted = ReplayPaths.DeletedDirectory();
         var changed = false;
         foreach (var file in stored)
         {
-            if (file.Header.Timestamp == 0 || file.Header.Timestamp > cutoff)
+            var age = DeleteAnchor(file.Path, file.Header.Timestamp);
+            if (age == 0 || age > cutoff)
                 continue;
-            if (kept.Contains(Path.GetFullPath(file.Path)))
+            if (IsInLibrary(file.Path) && kept.Contains(Path.GetFullPath(file.Path)))
                 continue;
 
             try
             {
                 Directory.CreateDirectory(deleted);
-                if (MoveToDeleted(file.Path, deleted))
-                    changed = true;
+                lock (FileGate)
+                {
+                    if (MoveToDeleted(file.Path, deleted))
+                        changed = true;
+                }
             }
             catch (Exception e)
             {
@@ -571,49 +663,99 @@ internal static class Catalog
         return changed;
     }
 
-    private static bool TrimDeleted()
+    internal static void ResetDeleteTimer(string? path)
     {
-        var max = C.MaxLibraryGigabytes;
-        if (max <= 0)
-            return false;
+        if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            return;
 
+        var meta = Path.ChangeExtension(path, ".json");
+        try
+        {
+            var obj = File.Exists(meta) ? JsonNode.Parse(File.ReadAllText(meta)) as JsonObject : null;
+            obj ??= new JsonObject();
+            obj["deleteFrom"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            File.WriteAllText(meta, obj.ToJsonString());
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Error(e, "Failed to reset the delete timer {Path}", path);
+        }
+    }
+
+    private static long DeleteAnchor(string path, uint recorded)
+    {
+        var meta = Path.ChangeExtension(path, ".json");
+        if (!File.Exists(meta))
+            return recorded;
+
+        try
+        {
+            var obj = JsonNode.Parse(File.ReadAllText(meta)) as JsonObject;
+            if (obj?["deleteFrom"] is JsonValue value && value.TryGetValue<long>(out var from) && from > 0)
+                return from;
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Error(e, "Failed to read the delete timer {Path}", path);
+        }
+
+        return recorded;
+    }
+
+    private static List<DeletedFile> ReadDeleted()
+    {
+        var files = new List<DeletedFile>();
         var deleted = ReplayPaths.DeletedDirectory();
         if (!Directory.Exists(deleted))
+            return files;
+
+        foreach (var path in Directory.EnumerateFiles(deleted, "*.dat"))
+        {
+            if (IsLegacyPart(path) || IsSplitFile(path) || !ReplayFile.TryRead(path, out var header))
+                continue;
+
+            files.Add(new DeletedFile(path, File.GetCreationTimeUtc(path), header.Length));
+        }
+
+        return files;
+    }
+
+    private static bool TrimDeleted(List<DeletedFile> files)
+    {
+        var max = C.MaxLibraryGigabytes;
+        if (max <= 0 || files.Count == 0)
             return false;
 
         var budget = (long)max * 1024 * 1024 * 1024;
-        var files = new List<(string Path, uint Timestamp, long Length)>();
         long total = 0;
-        foreach (var path in Directory.EnumerateFiles(deleted, "*.dat"))
-        {
-            if (IsConvertedSibling(path) || IsSplitFile(path) || !ReplayFile.TryRead(path, out var header))
-                continue;
-
-            files.Add((path, header.Timestamp, header.Length));
-            total += header.Length;
-        }
+        foreach (var file in files)
+            total += file.Length;
 
         if (total <= budget)
             return false;
 
-        files.Sort(static (left, right) =>
+        var ordered = files.ToList();
+        ordered.Sort(static (left, right) =>
         {
-            var time = DeletedOrder(left.Timestamp).CompareTo(DeletedOrder(right.Timestamp));
+            var time = left.Arrived.CompareTo(right.Arrived);
             return time != 0
                 ? time
                 : string.Compare(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
         });
 
         var changed = false;
-        foreach (var file in files)
+        foreach (var file in ordered)
         {
             if (total <= budget)
                 break;
 
             try
             {
-                if (!RemoveReplay(file.Path))
-                    continue;
+                lock (FileGate)
+                {
+                    if (!RemoveReplay(file.Path))
+                        continue;
+                }
 
                 total -= file.Length;
                 changed = true;
@@ -628,22 +770,16 @@ internal static class Catalog
         return changed;
     }
 
-    private static uint DeletedOrder(uint timestamp) => timestamp == 0 ? uint.MaxValue : timestamp;
-
     private static HashSet<string> KeptPaths(List<StoredReplay>? libraryFiles = null)
     {
-        var place = ContentPlacement();
-
-        var files = libraryFiles == null
-            ? DeletableFiles()
-            : [.. libraryFiles];
+        var files = libraryFiles ?? ReadStored(ReplayPaths.LibraryDirectory());
 
         var kept = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var group in files.GroupBy(ContentKey))
         {
             var id = group.First().Header.ContentFinderConditionId;
             var count = Math.Max(0, C.DefaultKeepCount);
-            if (id != 0 && place.TryGetValue(id, out var found))
+            if (id != 0 && TryPlace(id, out var found))
                 count = C.ResolveKeep(id, found.Type, found.Patch);
             else if (id != 0 && C.TryCount(KeepCount.Content, 0, 0, id, out var content))
                 count = content;
@@ -651,88 +787,67 @@ internal static class Catalog
             if (count <= 0)
                 continue;
 
-            var taken = 0;
-            foreach (var recording in Rank(group))
+            var ranked = new List<StoredReplay>();
+            foreach (var file in group)
             {
-                if (taken >= count)
-                    break;
-
-                foreach (var file in recording)
-                    kept.Add(Path.GetFullPath(file.Path));
-                taken++;
+                if (ReadFileMark(file.Path).SourceBuild == 0)
+                    ranked.Add(file);
             }
+
+            ranked.Sort(CompareLock);
+            var taken = Math.Min(count, ranked.Count);
+            for (var index = 0; index < taken; index++)
+                kept.Add(Path.GetFullPath(ranked[index].Path));
         }
 
         return kept;
     }
 
-    private static Dictionary<uint, (uint Type, uint Patch)> ContentPlacement()
+    private static int CompareLock(StoredReplay left, StoredReplay right)
     {
-        var map = new Dictionary<uint, (uint Type, uint Patch)>();
-        foreach (var row in PluginServices.DataManager.GetExcelSheet<ContentFinderCondition>())
-        {
-            if (row.RowId == 0)
-                continue;
+        var tier = LockTier(left).CompareTo(LockTier(right));
+        if (tier != 0)
+            return tier;
 
-            map[row.RowId] = (row.ContentType.RowId, row.RequiredExVersion.RowId);
-        }
-
-        return map;
+        var time = right.Header.Timestamp.CompareTo(left.Header.Timestamp);
+        return time != 0
+            ? time
+            : string.Compare(left.Path, right.Path, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static List<List<StoredReplay>> Rank(IEnumerable<StoredReplay> files)
+    private static int LockTier(StoredReplay file)
     {
-        var recordings = new List<List<StoredReplay>>();
-        foreach (var file in files)
+        if (!file.Header.Cleared)
+            return 2;
+
+        return file.Header.GameBuildRevision == GameBuild.Current ? 0 : 1;
+    }
+
+    private static bool TryPlace(uint contentId, out (uint Type, uint Patch) found)
+    {
+        lock (PlacementCache)
         {
-            List<StoredReplay>? recording = null;
-            if (file.Header.Timestamp != 0)
-                recording = recordings.Find(row => row[0].Header.Timestamp == file.Header.Timestamp);
-            if (recording == null)
+            if (PlacementCache.TryGetValue(contentId, out var cached))
             {
-                recording = [];
-                recordings.Add(recording);
+                found = cached.GetValueOrDefault();
+                return cached.HasValue;
+            }
+        }
+
+        var row = PluginServices.DataManager.GetExcelSheet<ContentFinderCondition>().GetRowOrDefault(contentId);
+        lock (PlacementCache)
+        {
+            if (row == null)
+            {
+                PlacementCache[contentId] = null;
+                found = default;
+                return false;
             }
 
-            recording.Add(file);
+            found = (row.Value.ContentType.RowId, row.Value.RequiredExVersion.RowId);
+            PlacementCache[contentId] = found;
+            return true;
         }
-
-        recordings.Sort(static (left, right) =>
-        {
-            var cleared = Cleared(right).CompareTo(Cleared(left));
-            if (cleared != 0)
-                return cleared;
-            var anonymized = Anonymized(right).CompareTo(Anonymized(left));
-            if (anonymized != 0)
-                return anonymized;
-            var time = right[0].Header.Timestamp.CompareTo(left[0].Header.Timestamp);
-            if (time != 0)
-                return time;
-            var build = CurrentBuild(right).CompareTo(CurrentBuild(left));
-            return build != 0
-                ? build
-                : string.Compare(BestPath(left), BestPath(right), StringComparison.OrdinalIgnoreCase);
-        });
-        return recordings;
-    }
-
-    private static bool Cleared(List<StoredReplay> files) => files.Exists(static file => file.Header.Cleared);
-
-    private static bool Anonymized(List<StoredReplay> files) => files.Exists(static file => file.Anonymized);
-
-    private static bool CurrentBuild(List<StoredReplay> files) =>
-        files.Exists(static file => file.Header.GameBuildRevision == GameBuild.Current);
-
-    private static string BestPath(List<StoredReplay> files)
-    {
-        var path = files[0].Path;
-        for (var index = 1; index < files.Count; index++)
-        {
-            if (string.Compare(files[index].Path, path, StringComparison.OrdinalIgnoreCase) < 0)
-                path = files[index].Path;
-        }
-
-        return path;
     }
 
     private static string ContentKey(StoredReplay file)
@@ -750,18 +865,14 @@ internal static class Catalog
         if (!Directory.Exists(replay))
             return files;
 
-        var deleted = Path.GetFullPath(ReplayPaths.DeletedDirectory());
-        var library = Path.GetFullPath(ReplayPaths.LibraryDirectory());
         foreach (var path in Directory.EnumerateFiles(replay, "*.dat", SearchOption.AllDirectories))
         {
-            var full = Path.GetFullPath(path);
-            if (full.StartsWith(deleted + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-                || full.StartsWith(library + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            if (IsInside(path, ReplayPaths.DeletedDirectory()) || IsInLibrary(path))
                 continue;
-            if (ReplayFile.IsLoadFile(path) || IsConvertedSibling(path) || IsSplitFile(path) || !ReplayFile.TryRead(path, out var header))
+            if (ReplayFile.IsLoadFile(path) || IsLegacyPart(path) || IsSplitFile(path) || !ReplayFile.TryRead(path, out var header))
                 continue;
 
-            files.Add(new StoredReplay(path, header, ReadFileMark(path).Anonymized));
+            files.Add(new StoredReplay(path, header));
         }
 
         return files;
@@ -876,9 +987,20 @@ internal static class Catalog
         return true;
     }
 
+    internal static string CopyLabel(string path)
+    {
+        var stem = Path.GetFileNameWithoutExtension(path);
+        var dash = stem.LastIndexOf('-');
+        if (dash <= 0)
+            return string.Empty;
+
+        var suffix = stem[(dash + 1)..];
+        return IsDigits(suffix) ? stem[dash..] : string.Empty;
+    }
+
     private static bool IsDigits(string text) => text.Length > 0 && text.All(char.IsDigit);
 
-    private static bool IsConvertedSibling(string path)
+    private static bool IsLegacyPart(string path)
     {
         var name = Path.GetFileName(path);
         var marker = name.LastIndexOf(".c", StringComparison.Ordinal);

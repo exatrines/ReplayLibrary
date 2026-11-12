@@ -57,6 +57,34 @@ internal static class ReplayConvertClient
         }
     }
 
+    internal static string TakeReport()
+    {
+        try
+        {
+            return PluginServices.PluginInterface.GetIpcSubscriber<string>("ReplayConverter.TakeReport").InvokeFunc();
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Warning(e, "Replay Converter did not report");
+            return LastReport();
+        }
+    }
+
+    internal static string PhaseFor(string path)
+    {
+        if (!IsLoaded || path.Length == 0)
+            return "";
+
+        try
+        {
+            return PluginServices.PluginInterface.GetIpcSubscriber<string, string>("ReplayConverter.JobPhaseFor").InvokeFunc(path);
+        }
+        catch (Exception)
+        {
+            return "";
+        }
+    }
+
     private static string? Invoke(string name, string source)
     {
         try

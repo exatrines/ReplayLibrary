@@ -111,12 +111,12 @@ internal static class ReplayFile
             if (payload + length > end)
                 return;
 
-            if (opcode == 743 && length == 3672 && BitConverter.ToUInt32(bytes, payload + contentAt) == recorded)
+            if (opcode == 995 && length == 3672 && BitConverter.ToUInt32(bytes, payload + contentAt) == recorded)
             {
                 BitConverter.GetBytes(local).CopyTo(bytes, payload + contentAt);
                 changed = true;
             }
-            else if (opcode == 380 && length == 664 && BitConverter.ToUInt32(bytes, payload + 8) == recorded)
+            else if (opcode == 764 && length == 664 && BitConverter.ToUInt32(bytes, payload + 8) == recorded)
             {
                 BitConverter.GetBytes(local).CopyTo(bytes, payload + 8);
                 changed = true;
@@ -149,7 +149,7 @@ internal static class ReplayFile
             if (payload + length > end)
                 return 0;
 
-            if (opcode == 743 && length == 3672)
+            if (opcode == 995 && length == 3672)
             {
                 var id = BitConverter.ToUInt32(bytes, payload + contentAt);
                 if (id != 0)

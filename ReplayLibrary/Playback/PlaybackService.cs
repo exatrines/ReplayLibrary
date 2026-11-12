@@ -23,6 +23,7 @@ internal static unsafe class PlaybackService
     private static float? _speedOverride;
     private static int? _loadedSlot;
     private static string? _loadedPath;
+    private static long _loadedWrite;
 
     internal static bool InInn
     {
@@ -127,6 +128,7 @@ internal static unsafe class PlaybackService
         _speedOverride = null;
         _loadedSlot = slot;
         _loadedPath = libraryPath;
+        _loadedWrite = File.GetLastWriteTimeUtc(libraryPath).Ticks;
         PlaybackReader.Watch(destination);
         PluginServices.ChatGui.Print($"Loaded the replay into slot {slot + 1}.");
         return true;
@@ -163,6 +165,7 @@ internal static unsafe class PlaybackService
     {
         var loaded = _loadedSlot == slot
             && _loadedPath != null
+            && _loadedWrite == File.GetLastWriteTimeUtc(libraryPath).Ticks
             && string.Equals(_loadedPath, libraryPath, StringComparison.OrdinalIgnoreCase);
         if (!loaded && !Play(libraryPath, slot))
             return false;

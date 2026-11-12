@@ -4,7 +4,7 @@
   "Punchline": "Everything you need for replays—all in one place!",
   "Description": "Records duty replays and manages them per content, with the other replay tools alongside.",
   "InternalName": "ReplayLibrary",
-  "AssemblyVersion": "0.1.0.0",
+  "AssemblyVersion": "0.1.2.0",
   "ApplicableVersion": "any",
   "DalamudApiLevel": "15",
   "RepoUrl": "https://github.com/exatrines/ReplayLibrary",
@@ -13,6 +13,6 @@
     "replay",
     "duty"
   ],
-  "DownloadLinkInstall": "https://github.com/exatrines/ReplayLibrary/releases/download/v0.1.0/ReplayLibrary.zip",
-  "DownloadLinkUpdate": "https://github.com/exatrines/ReplayLibrary/releases/download/v0.1.0/ReplayLibrary.zip"
+  "DownloadLinkInstall": "https://github.com/exatrines/ReplayLibrary/releases/download/v0.1.2/ReplayLibrary.zip",
+  "DownloadLinkUpdate": "https://github.com/exatrines/ReplayLibrary/releases/download/v0.1.2/ReplayLibrary.zip"
 }

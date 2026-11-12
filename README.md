@@ -42,8 +42,8 @@ https://raw.githubusercontent.com/exatrines/DalamudPlugins/refs/heads/main/plugi
 
 - **Library** — Browse saved replays, filter them, and play a current-patch replay from an inn
 - **Recording** — Record checked content types into `replay/replaylibrary`
-- **Auto-lock** — Keep a set number of replays per duty, with cleared replays first
-- **Auto-delete** — Move the rest to Deleted after a number of days, then trim that folder by size
+- **Auto-lock** — Lock a set number per content. Unconverted replays come first: current-patch clears, then older-patch clears, then uncleared. Converted replays are not locked
+- **Auto-delete** — Move unlocked replays to Deleted after the set number of days, then trim that folder by size
 - **Convert and anonymize** — Shown when Replay Converter is loaded. Disabled until that plugin is signed in
 - **Language and themes** — English or Japanese, and window themes
 

@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-12
+
+### Changed
+
+- Replay Library treats patch 7.58 as the current patch.
+- Replay Library locks unconverted replays only, up to the count set for that content. Order is current-patch clears, then older-patch clears, then uncleared replays, newest first. Locks are chosen again from the files present. A locked replay can still be deleted.
+- Replay Library moves only the selected file to Deleted. Files in Deleted are removed when the folder passes the size limit, starting with the ones moved there first.
+- Converting a replay restarts the delete timer for the original and the converted file. The date shown on the replay stays the recording date.
+- Replay Library and Replay Converter use the same list. A group with a file in progress reads `Waiting - (2)`. Rows and the card show the clear and anonymize marks.
+- Replay Converter's card names the patch a file was converted from.
+
+### Fixed
+
+- Replay Library no longer stalls the game while scanning the library.
+- Playing a library replay again loads the file when that file has been replaced.
+
 ## [0.1.1] - 2026-11-09
 
 ### Replay Converter

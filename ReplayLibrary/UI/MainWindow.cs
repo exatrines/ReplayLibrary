@@ -416,7 +416,9 @@ internal sealed partial class MainWindow : Window
     private static string ReplayLine(Catalog.Entry entry)
     {
         var recorded = RecordedText(entry);
-        return string.IsNullOrEmpty(recorded) ? entry.FolderName : $"{entry.FolderName} - {recorded}";
+        var line = string.IsNullOrEmpty(recorded) ? entry.FolderName : $"{entry.FolderName} - {recorded}";
+        var copy = Catalog.CopyLabel(entry.Path);
+        return copy.Length == 0 ? line : $"{line} {copy}";
     }
 
     private static bool IsMismatch(Catalog.Entry entry) =>

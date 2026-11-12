@@ -203,10 +203,16 @@ internal sealed partial class MainWindow
 
     private void PaintLibraryGroup(Catalog.Entry entry, int count, bool open)
     {
-        PaintLibraryIdentity(entry, $"({count})", open ? FontAwesomeIcon.ChevronDown : FontAwesomeIcon.ChevronRight);
+        var job = GroupJobText(entry.ContentId);
+        var label = job.Length == 0 ? $"({count})" : $"{job} - ({count})";
+        PaintLibraryIdentity(
+            entry,
+            label,
+            open ? FontAwesomeIcon.ChevronDown : FontAwesomeIcon.ChevronRight,
+            countAccent: job.Length > 0);
     }
 
-    private void PaintLibraryIdentity(Catalog.Entry entry, string? count, FontAwesomeIcon? chevron)
+    private void PaintLibraryIdentity(Catalog.Entry entry, string? count, FontAwesomeIcon? chevron, string? jobLabel = null, bool countAccent = false)
     {
         var min = ImGui.GetItemRectMin();
         var max = ImGui.GetItemRectMax();
@@ -215,6 +221,10 @@ internal sealed partial class MainWindow
         var gap = ImGui.GetStyle().ItemInnerSpacing.X;
         var y = min.Y + (max.Y - min.Y - icon) * 0.5f;
         var edge = max.X - pad;
+        var job = jobLabel ?? (count == null && chevron == null ? RowJobText(entry.Path) : "");
+        var jobWidth = job.Length == 0 ? 0f : ImGui.CalcTextSize(job).X;
+        if (jobWidth > 0f)
+            edge -= gap + jobWidth;
         var x = min.X + pad;
         var patchKey = LibraryPatchKey(entry);
         var knownPatch = uint.TryParse(patchKey, out var exVersion);
@@ -239,8 +249,12 @@ internal sealed partial class MainWindow
         if (countWidth > 0f)
         {
             var countX = chevron.HasValue ? edge - chevronWidth - gap - countWidth : edge - countWidth;
-            draw.AddText(new Vector2(countX, textY), MirageUi.ToUInt(MirageUi.GetColor(MirageUi.Color.Secondary)), count);
+            var countColor = countAccent ? MirageUi.Color.Accent : MirageUi.Color.Secondary;
+            draw.AddText(new Vector2(countX, textY), MirageUi.ToUInt(MirageUi.GetColor(countColor)), count);
         }
+
+        if (jobWidth > 0f)
+            draw.AddText(new Vector2(max.X - pad - jobWidth, textY), MirageUi.ToUInt(MirageUi.GetColor(MirageUi.Color.Accent)), job);
 
         if (!chevron.HasValue)
             return;
@@ -268,6 +282,10 @@ internal sealed partial class MainWindow
         var indent = LibraryContentIconSize() + gap;
         var y = min.Y + (max.Y - min.Y - icon) * 0.5f;
         var edge = max.X - pad;
+        var job = RowJobText(entry.Path);
+        var jobWidth = job.Length == 0 ? 0f : ImGui.CalcTextSize(job).X;
+        if (jobWidth > 0f)
+            edge -= gap + jobWidth;
         var x = min.X + pad + indent;
         PaintLibraryGlyph(FontAwesomeIcon.Lock, new Vector2(x, y), entry.Protected ? LockColor : LibraryMuted());
         x += icon + gap;
@@ -279,7 +297,7 @@ internal sealed partial class MainWindow
         var recorded = RecordedText(entry);
         var recordedText = string.IsNullOrEmpty(recorded) ? "Unknown" : recorded;
         var known = uint.TryParse(entry.Version, out var build);
-        var buildText = known ? FormatBuild(build) : "Unknown";
+        var buildText = BuildLabel(entry);
         var buildWidth = ImGui.CalcTextSize(buildText).X;
         var textY = min.Y + (max.Y - min.Y - ImGui.GetTextLineHeight()) * 0.5f;
         var dateNatural = ImGui.CalcTextSize(recordedText).X;
@@ -326,6 +344,9 @@ internal sealed partial class MainWindow
             draw.AddText(new Vector2(x, textY), MirageUi.ToUInt(buildColor), buildText);
             draw.PopClipRect();
         }
+
+        if (jobWidth > 0f)
+            draw.AddText(new Vector2(max.X - pad - jobWidth, textY), MirageUi.ToUInt(MirageUi.GetColor(MirageUi.Color.Accent)), job);
     }
 
     private static float PaintLibraryParty(Catalog.Entry entry, float x, float top, float bottom, float limit)
@@ -1001,7 +1022,7 @@ internal sealed partial class MainWindow
     {
         var ink = MirageUi.GetColor(MirageUi.Color.Default);
         var known = uint.TryParse(entry.Version, out var build);
-        var version = known ? FormatBuild(build) : "Unknown";
+        var version = BuildLabel(entry);
         var versionColor = known && build != GameBuild.Current ? MismatchColor : ink;
         var converted = entry.SourceBuild != 0 ? $" converted from {FormatBuild(entry.SourceBuild)}" : null;
         DrawCardIconText(FontAwesomeIcon.Hammer, version, ink, false, textColor: versionColor, suffix: converted);
@@ -1180,6 +1201,27 @@ internal sealed partial class MainWindow
         draw.AddText(UiBuilder.IconFont, mark, pos, ink, glyph);
     }
 
+    private static string RowJobText(string path)
+    {
+        var phase = ReplayConvertClient.PhaseFor(path);
+        return phase.Length == 0 ? "" : LibraryText.Get("card.row." + phase);
+    }
+
+    private string GroupJobText(uint contentId)
+    {
+        foreach (var entry in _entries)
+        {
+            if (entry.ContentId != contentId)
+                continue;
+
+            var text = RowJobText(entry.Path);
+            if (text.Length > 0)
+                return text;
+        }
+
+        return "";
+    }
+
     private void DrawCardActions(Catalog.Entry entry, float width)
     {
         var current = IsCurrentBuild(entry);
@@ -1200,13 +1242,16 @@ internal sealed partial class MainWindow
         {
             var authed = ReplayConvertClient.IsAuthenticated;
             var authTip = authed ? null : LibraryText.Get("card.converter.auth");
+            var busy = ReplayConvertClient.PhaseFor(entry.Path).Length > 0;
             var reconvert = current && entry.SourceBuild != 0;
             var canConvert = !current && ParsedBuild(entry) != 0;
-            var convertEnabled = authed && (reconvert || canConvert);
+            var convertEnabled = authed && !busy && (reconvert || canConvert);
             string? convertTip = authTip;
             if (convertTip == null)
             {
-                if (reconvert)
+                if (busy)
+                    convertTip = LibraryText.Get("card.job.busy");
+                else if (reconvert)
                     convertTip = LibraryText.Get("card.convert.again");
                 else if (current)
                     convertTip = LibraryText.Get("card.convert.current");
@@ -1225,31 +1270,29 @@ internal sealed partial class MainWindow
                 && convertEnabled)
                 StartConvert(entry);
 
-            var anonymizeEnabled = authed && current;
+            var anonymizeEnabled = authed && current && !busy;
             if (MirageUi.PrimaryIconLabelButton(
                     FontAwesomeIcon.UserSecret,
                     entry.Anonymized ? LibraryText.Get("card.reanonymize") : LibraryText.Get("card.anonymize"),
                     enabled: anonymizeEnabled,
                     width: width,
                     id: "card-anonymize",
-                    tooltip: authTip ?? (current ? null : LibraryText.Get("card.anonymize.current")),
+                    tooltip: authTip ?? (busy ? LibraryText.Get("card.job.busy") : current ? null : LibraryText.Get("card.anonymize.current")),
                     tooltipPosition: MirageTooltipPosition.Right)
                 && anonymizeEnabled)
                 StartAnonymize(entry);
         }
 
-        var protectedReplay = entry.Protected;
         var inLibrary = Catalog.IsInLibrary(entry.Path);
         if (MirageUi.PrimaryIconLabelButton(
                 FontAwesomeIcon.Trash,
                 LibraryText.Get("card.delete"),
-                enabled: inLibrary && !protectedReplay,
+                enabled: inLibrary,
                 width: width,
                 id: "card-delete",
-                tooltip: protectedReplay ? LibraryText.Get("card.delete.protected") : inLibrary ? null : LibraryText.Get("card.delete.outside"),
+                tooltip: inLibrary ? null : LibraryText.Get("card.delete.outside"),
                 tooltipPosition: MirageTooltipPosition.Right)
-            && inLibrary
-            && !protectedReplay)
+            && inLibrary)
             AskDelete(LibraryText.Get("dialog.delete.title"), LibraryText.Format("dialog.delete.message", ReplayLine(entry)), [entry.Path]);
 
         if (MirageUi.PrimaryIconLabelButton(FontAwesomeIcon.Folder, LibraryText.Get("card.explorer"), width: width, id: "card-explorer"))
@@ -1345,13 +1388,17 @@ internal sealed partial class MainWindow
         _ = Task.Run(() =>
         {
             var output = ReplayConvertClient.Convert(path);
-            var report = ReplayConvertClient.LastReport();
-            PluginServices.Framework.RunOnFrameworkThread(() => FinishConvert(output, report));
+            var report = ReplayConvertClient.TakeReport();
+            PluginServices.Framework.RunOnFrameworkThread(() => FinishConvert(path, output, report));
         });
     }
 
-    private void FinishConvert(string? output, string report)
+    private void FinishConvert(string source, string? output, string report)
     {
+        Catalog.ResetDeleteTimer(source);
+        if (output != null)
+            Catalog.ResetDeleteTimer(output);
+
         if (output == null)
         {
             PluginServices.ChatGui.PrintError(string.IsNullOrEmpty(report) ? "Could not convert this replay." : report);
@@ -1423,7 +1470,7 @@ internal sealed partial class MainWindow
         _ = Task.Run(() =>
         {
             var output = ReplayConvertClient.Anonymize(path, replace);
-            var report = ReplayConvertClient.LastReport();
+            var report = ReplayConvertClient.TakeReport();
             PluginServices.Framework.RunOnFrameworkThread(() => FinishAnonymize(path, replace, output, report));
         });
     }
@@ -1506,8 +1553,16 @@ internal sealed partial class MainWindow
     }
 
     private static string PatchLabel(string version) =>
-        version == "14155597" ? "7.57hf1" : version;
+        version == "14251429" ? "7.58" : version == "14155597" ? "7.57hf1" : version;
 
     private static string FormatBuild(uint build) =>
         PatchLabel(build.ToString());
+
+    private static string BuildLabel(Catalog.Entry entry)
+    {
+        var known = uint.TryParse(entry.Version, out var build);
+        var text = known ? FormatBuild(build) : "Unknown";
+        var copy = Catalog.CopyLabel(entry.Path);
+        return copy.Length == 0 ? text : $"{text} {copy}";
+    }
 }
