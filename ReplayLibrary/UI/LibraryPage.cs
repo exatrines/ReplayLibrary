@@ -412,35 +412,37 @@ internal sealed partial class MainWindow
     private List<LibraryListRow> LibraryListRows()
     {
         var visible = _entries.Where(LibraryVisible).ToList();
-        var heads = new List<(Catalog.Entry Head, Catalog.Entry[]? Members)>();
+        var heads = new List<(Catalog.Entry Head, Catalog.Entry[]? Members, uint Newest)>();
         foreach (var bucket in visible.GroupBy(entry => entry.ContentId))
         {
             var members = bucket
-                .OrderByDescending(entry => entry.Timestamp)
+                .OrderBy(LibraryRank)
+                .ThenByDescending(entry => entry.Timestamp)
                 .ThenBy(entry => entry.FolderName, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            var newest = members.Max(entry => entry.Timestamp);
             if (bucket.Key == 0)
             {
                 foreach (var entry in members)
-                    heads.Add((entry, null));
+                    heads.Add((entry, null, entry.Timestamp));
                 continue;
             }
 
-            heads.Add((members[0], members));
+            heads.Add((members[0], members, newest));
         }
 
         var ordered = _librarySort == LibrarySort.Newest
             ? heads
-                .OrderByDescending(row => row.Head.Timestamp)
+                .OrderByDescending(row => row.Newest)
                 .ThenBy(row => row.Head.FolderName, StringComparer.OrdinalIgnoreCase)
             : heads
                 .OrderBy(row => row.Head.ContentTypeId == 0 ? uint.MaxValue : row.Head.ContentTypeId)
                 .ThenByDescending(row => row.Head.ContentId)
-                .ThenByDescending(row => row.Head.Timestamp)
+                .ThenByDescending(row => row.Newest)
                 .ThenBy(row => row.Head.FolderName, StringComparer.OrdinalIgnoreCase);
 
         var rows = new List<LibraryListRow>();
-        foreach (var (head, members) in ordered)
+        foreach (var (head, members, _) in ordered)
         {
             if (members == null)
             {
@@ -457,6 +459,13 @@ internal sealed partial class MainWindow
         }
 
         return rows;
+    }
+
+    private static int LibraryRank(Catalog.Entry entry)
+    {
+        if (entry.Protected)
+            return entry.Cleared ? 0 : 1;
+        return entry.Cleared ? 2 : 3;
     }
 
     private string LibraryPatchKey(Catalog.Entry entry)
@@ -1243,9 +1252,10 @@ internal sealed partial class MainWindow
             var authed = ReplayConvertClient.IsAuthenticated;
             var authTip = authed ? null : LibraryText.Get("card.converter.auth");
             var busy = ReplayConvertClient.PhaseFor(entry.Path).Length > 0;
-            var reconvert = current && entry.SourceBuild != 0;
-            var canConvert = !current && ParsedBuild(entry) != 0;
-            var convertEnabled = authed && !busy && (reconvert || canConvert);
+            var convertBuild = current ? entry.SourceBuild : ParsedBuild(entry);
+            var supported = ReplayConvertClient.CanConvert(convertBuild);
+            var reconvert = current && supported;
+            var convertEnabled = authed && !busy && supported;
             string? convertTip = authTip;
             if (convertTip == null)
             {
@@ -1253,9 +1263,9 @@ internal sealed partial class MainWindow
                     convertTip = LibraryText.Get("card.job.busy");
                 else if (reconvert)
                     convertTip = LibraryText.Get("card.convert.again");
-                else if (current)
+                else if (current && entry.SourceBuild == 0)
                     convertTip = LibraryText.Get("card.convert.current");
-                else if (!canConvert)
+                else if (!supported)
                     convertTip = LibraryText.Get("card.convert.nomap");
             }
 
@@ -1376,7 +1386,7 @@ internal sealed partial class MainWindow
         }
 
         Refresh();
-        if (ReplayFile.TryRead(adopted, out var header) && header.GameBuildRevision != GameBuild.Current)
+        if (ReplayFile.TryRead(adopted, out var header) && ReplayConvertClient.CanConvert(header.GameBuildRevision))
             RunConvert(adopted);
     }
 

@@ -210,6 +210,8 @@ internal sealed partial class MainWindow : Window
         return width;
     }
 
+    internal bool IsExpanded => IsOpen && !_chromeCollapsed;
+
     public override void OnOpen()
     {
         Refresh();

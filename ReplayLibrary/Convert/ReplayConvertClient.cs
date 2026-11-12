@@ -28,6 +28,22 @@ internal static class ReplayConvertClient
         }
     }
 
+    internal static bool CanConvert(uint build)
+    {
+        if (!IsLoaded || build == 0)
+            return false;
+
+        try
+        {
+            return PluginServices.PluginInterface.GetIpcSubscriber<uint, bool>("ReplayConverter.CanConvert").InvokeFunc(build);
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Warning(e, "Replay Converter did not answer");
+            return false;
+        }
+    }
+
     internal static string? Convert(string source) => Invoke("ReplayConverter.Convert", source);
 
     internal static string? Anonymize(string source, bool replace)

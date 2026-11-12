@@ -351,7 +351,12 @@ internal static class Catalog
         try
         {
             lock (FileGate)
+            {
                 File.Move(sourcePath, destination);
+                MoveSidecar(sourcePath, destination, clearDestination: false);
+            }
+
+            ResetDeleteTimer(destination);
         }
         catch (Exception e)
         {
@@ -697,6 +702,20 @@ internal static class Catalog
         catch (Exception e)
         {
             PluginServices.Log.Error(e, "Failed to read the delete timer {Path}", path);
+        }
+
+        if (IsInLibrary(path))
+            return recorded;
+
+        try
+        {
+            var created = new DateTimeOffset(File.GetCreationTimeUtc(path)).ToUnixTimeSeconds();
+            if (created > 0)
+                return created;
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Error(e, "Failed to read the file time {Path}", path);
         }
 
         return recorded;

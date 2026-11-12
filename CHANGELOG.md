@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-13
+
+### Changed
+
+- Replay Library lists the replays in a duty with locked clears first, then locked replays that are not cleared, then other clears, then the rest. Within each of those, newer recordings come first. Duties stay ordered by their newest replay.
+- Replay Library and Replay Converter start the delete timer when a replay is filed into the library. Replays already there keep the timer they have. A replay left outside the library uses the time Windows recorded for that file, so an old replay copied in is not removed on the next check. The date shown on the replay stays the recording date.
+- Replay Library checks the delete deadline and the Deleted folder size only while its window is open and not collapsed. Finishing a recording, or changing the delete settings, still runs that check right away.
+- Replay Converter converts only 7.57 replays. Other builds are left unchanged, and Convert stays off. Replay Library uses the same rule. A 7.58 replay converted from 7.57 can still be converted again.
+
 ## [0.1.2] - 2026-11-12
 
 ### Changed

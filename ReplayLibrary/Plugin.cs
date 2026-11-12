@@ -118,7 +118,7 @@ public sealed class Plugin : IDalamudPlugin
         Library.ReplayBackup.FlushSave();
         var migrated = Library.Catalog.MigrateLegacy();
         Library.ReplayBackup.StartLibraryIfDue();
-        var maintained = Library.Catalog.MaintainLibrary();
+        var maintained = _window.IsExpanded && Library.Catalog.MaintainLibrary();
         if ((migrated || maintained) && _window.IsOpen)
             _window.Refresh();
         _recording.Update();
