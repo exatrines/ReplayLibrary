@@ -1,5 +1,4 @@
 using System.Runtime.InteropServices;
-using Dalamud.Game.ClientState.Conditions;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using Lumina.Excel.Sheets;
 using TerritoryUse = FFXIVClientStructs.FFXIV.Client.Enums.TerritoryIntendedUse;
@@ -20,7 +19,6 @@ internal static unsafe class PlaybackService
     private static bool _setChapterResolved;
     private static delegate* unmanaged<ContentsReplayManager*, byte, byte> _setChapter;
     private static bool _wasPlaying;
-    private static float? _speedOverride;
     private static int? _loadedSlot;
     private static string? _loadedPath;
     private static long _loadedWrite;
@@ -62,28 +60,14 @@ internal static unsafe class PlaybackService
             if (_wasPlaying)
                 PlaybackReader.Clear();
             _wasPlaying = false;
-            _speedOverride = null;
             return;
         }
 
         if (!_wasPlaying)
         {
             _wasPlaying = true;
-            _speedOverride = null;
-            PlaybackReader.LoadCurrent();
+            PlaybackReader.PreparePlayback();
         }
-
-        if (_speedOverride is float speed)
-            manager->PlaybackSpeed = speed;
-        else if (manager->PlaybackSpeed <= 0)
-        {
-            manager->PlaybackSpeed = 1;
-            manager->PlaybackControls &= ~ContentsReplayPlaybackControl.Paused;
-        }
-
-        var address = PluginServices.Condition.Address;
-        if (address != 0)
-            *(bool*)(address + (int)ConditionFlag.OccupiedInCutSceneEvent) = false;
     }
 
     internal static bool Play(string libraryPath, int slot = 0)
@@ -125,7 +109,6 @@ internal static unsafe class PlaybackService
             return false;
         }
 
-        _speedOverride = null;
         _loadedSlot = slot;
         _loadedPath = libraryPath;
         _loadedWrite = File.GetLastWriteTimeUtc(libraryPath).Ticks;
@@ -175,7 +158,6 @@ internal static unsafe class PlaybackService
 
     internal static void SetSpeed(float speed)
     {
-        _speedOverride = speed;
         var manager = ContentsReplayManager.Instance();
         if (manager != null && manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.InPlayback))
             manager->PlaybackSpeed = speed;

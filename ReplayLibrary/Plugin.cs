@@ -107,6 +107,7 @@ public sealed class Plugin : IDalamudPlugin
         _entities.Restore();
         _cameraLock.Dispose();
         _playbackHooks.Dispose();
+        PlaybackReader.ReleaseOnUnload();
         _playback.Dispose();
         _recording.Dispose();
         _windows.RemoveAllWindows();
@@ -117,6 +118,7 @@ public sealed class Plugin : IDalamudPlugin
     {
         Library.ReplayBackup.FlushSave();
         var migrated = Library.Catalog.MigrateLegacy();
+        Library.Catalog.MigrateLedger();
         Library.ReplayBackup.StartLibraryIfDue();
         var maintained = _window.IsExpanded && Library.Catalog.MaintainLibrary();
         if ((migrated || maintained) && _window.IsOpen)

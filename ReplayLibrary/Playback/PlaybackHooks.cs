@@ -29,7 +29,10 @@ internal sealed unsafe class PlaybackHooks : IDisposable
     private readonly CodePatch? _segmentPatch;
     private readonly Hook<SegmentDelegate>? _segment;
     private readonly Hook<UpdateDelegate>? _update;
+    private readonly Hook<RequestDelegate>? _request;
+    private readonly Hook<ActorDelegate>? _actor;
     private readonly Hook<ChapterDelegate>? _chapter;
+    private readonly byte[] _selectedHeader = new byte[ReplayFile.HeaderSize];
     private readonly Hook<ReplayDelegate>? _replay;
     private readonly Hook<PacketDelegate>? _rsv;
     private readonly Hook<PacketDelegate>? _rsf;
@@ -42,6 +45,8 @@ internal sealed unsafe class PlaybackHooks : IDisposable
 
     private delegate nint SegmentDelegate(ContentsReplayManager* manager);
     private delegate void UpdateDelegate(ContentsReplayManager* manager);
+    private delegate byte RequestDelegate(ContentsReplayManager* manager, byte slot);
+    private delegate void ActorDelegate(ContentsReplayManager* manager, uint objectId, nint packet);
     private delegate void ChapterDelegate(ContentsReplayManager* manager, byte chapter);
     private delegate byte ReplayDelegate(ContentsReplayManager* manager, byte* segment, byte* data);
     private delegate byte PacketDelegate(byte* data);
@@ -61,13 +66,18 @@ internal sealed unsafe class PlaybackHooks : IDisposable
 
         var segmentSite = Find("48 39 43 38 0F 83 ?? ?? ?? ?? 48 8B 4B 30");
         var login = Find("40 53 48 83 EC 20 F6 81 ?? ?? ?? ?? ?? 48 8B D9 0F 85 ?? ?? ?? ?? F6 81 ?? ?? ?? ?? ??");
-        if (segmentSite != 0 && login != 0 && ResumeMatches(segmentSite))
+        if (segmentSite != 0 && login != 0)
         {
             _segmentPatch = CodePatch.TryAt(segmentSite, SegmentRedirect(segmentSite, login));
+            _segmentPatch?.SetEnabled(true);
             _segment = Hook<SegmentDelegate>(login, OnSegment);
         }
 
-        _update = Hook<UpdateDelegate>(Follow("E8 ?? ?? ?? ?? F6 83 ?? ?? ?? ?? 04 74 38 F6 83 ?? ?? ?? ?? 01"), OnUpdate);
+        _update = Hook<UpdateDelegate>(Find("E8 ?? ?? ?? ?? F6 83 ?? ?? ?? ?? 04 74 38 F6 83 ?? ?? ?? ?? 01"), OnUpdate);
+        _request = Hook<RequestDelegate>("48 89 5C 24 08 57 48 83 EC 30 F6 81 ?? ?? ?? ?? 04", OnRequestPlayback);
+        _actor = Hook<ActorDelegate>(
+            "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 57 41 56 41 57 48 83 EC 30 33 FF 48 8B D9",
+            OnActorControl);
         _chapter = Hook<ChapterDelegate>(
             "48 89 5C 24 ?? 48 89 6C 24 ?? 48 89 74 24 ?? 48 89 7C 24 ?? 41 56 48 83 EC 30 48 8B F1 0F B6 EA",
             OnChapter);
@@ -84,6 +94,8 @@ internal sealed unsafe class PlaybackHooks : IDisposable
         _waymarks = WaymarkByte();
 
         _update?.Enable();
+        _request?.Enable();
+        _actor?.Enable();
         _chapter?.Enable();
         _replay?.Enable();
         _rsv?.Enable();
@@ -93,6 +105,8 @@ internal sealed unsafe class PlaybackHooks : IDisposable
         _format?.Enable();
 
         PluginServices.Toast.Toast += OnToast;
+        PlaybackReader.ApplySavedContentIds(PluginServices.PlayerState.ContentId);
+        PlaybackReader.ResumeClosedStream();
     }
 
     internal static bool WaymarksVisible => _current?._waymarks != null && (*_current._waymarks & 2) == 0;
@@ -161,6 +175,8 @@ internal sealed unsafe class PlaybackHooks : IDisposable
         _rsv?.Dispose();
         _replay?.Dispose();
         _chapter?.Dispose();
+        _actor?.Dispose();
+        _request?.Dispose();
         _update?.Dispose();
         _segment?.Dispose();
         _segmentPatch?.Dispose();
@@ -174,28 +190,54 @@ internal sealed unsafe class PlaybackHooks : IDisposable
 
     private void OnUpdate(ContentsReplayManager* manager)
     {
-        var feed = PlaybackReader.HasBuffer && _segment != null && _segmentPatch != null;
-        if (feed)
-        {
-            _segment!.Enable();
-            _segmentPatch!.SetEnabled(true);
-            PlaybackReader.ArmFastForward();
-        }
-
+        _segment?.Enable();
         try
         {
             _update!.Original(manager);
         }
         finally
         {
-            if (feed)
-            {
-                _segmentPatch!.SetEnabled(false);
-                _segment!.Disable();
-            }
+            _segment?.Disable();
         }
 
+        if (!PlaybackService.IsPlaying)
+            return;
+
+        var address = PluginServices.Condition.Address;
+        if (address != 0)
+            *(bool*)(address + (int)ConditionFlag.OccupiedInCutSceneEvent) = false;
+
         PlaybackReader.AfterPlaybackUpdate(manager);
+    }
+
+    private byte OnRequestPlayback(ContentsReplayManager* manager, byte slot)
+    {
+        var customSlot = slot == 100;
+        byte[]? previous = null;
+        if (customSlot)
+        {
+            slot = 0;
+            previous = PlaybackReader.ReadSavedHeader(0);
+            PlaybackReader.WriteSavedHeader(0, _selectedHeader);
+        }
+        else
+        {
+            PlaybackReader.SelectPlayback(null);
+        }
+
+        var result = _request!.Original(manager, slot);
+        if (customSlot && previous != null)
+            PlaybackReader.WriteSavedHeader(0, previous);
+        return result;
+    }
+
+    private void OnActorControl(ContentsReplayManager* manager, uint objectId, nint packet)
+    {
+        _actor!.Original(manager, objectId, packet);
+        if (packet == 0 || *(ushort*)packet != 931 || *(byte*)(packet + 4) == 0)
+            return;
+
+        PlaybackReader.ReloadStartedPlayback(manager);
     }
 
     private nint OnSegment(ContentsReplayManager* manager) => (nint)PlaybackReader.CurrentSegment(manager);
@@ -280,11 +322,11 @@ internal sealed unsafe class PlaybackHooks : IDisposable
         try
         {
             var manager = ContentsReplayManager.Instance();
-            if (manager == null || index > manager->NumChapters)
+            if (manager == null)
                 return text;
 
             var start = manager->Chapters[index - 1].PositionMs;
-            var end = index < manager->NumChapters
+            var end = index < 64
                 ? manager->Chapters[index].PositionMs
                 : manager->Header.TotalMs;
             if (end < start)
@@ -327,11 +369,6 @@ internal sealed unsafe class PlaybackHooks : IDisposable
         var target = site + 7 + Marshal.ReadInt32(site, 3);
         return (byte*)(target + WaymarkOffset);
     }
-
-    private static bool ResumeMatches(nint site) =>
-        Marshal.ReadByte(site, 0x48) == 0x4D
-        && Marshal.ReadByte(site, 0x49) == 0x85
-        && Marshal.ReadByte(site, 0x4A) == 0xF6;
 
     private static byte[] SegmentRedirect(nint site, nint login)
     {

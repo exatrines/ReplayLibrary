@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-18
+
+### Changed
+
+- For one recording, the list keeps the current patch. When an anonymized replay is shown, the original stays on disk and leaves the list. That original is not locked. A source replay is also left unlocked when its current-patch conversion is in the library. Reconvert still finds the original after it moves to Deleted.
+- Locks are current-patch clears, then older-patch clears, then uncleared replays, newest first.
+- The refresh button files loose replays into the library and reloads the list. A replay that was not already there starts its delete timer that day. The date shown stays the recording date.
+- Unlocked replays move to Deleted that many days after they entered the library. Replays already there keep a saved timer, or the recording date when none was saved. Converting does not restart the timer. The first launch copies those timers into `library.json` and removes the json file next to each replay.
+- A finished recording that matches a replay already in the library drops the slot file and keeps the library copy.
+- The playback bar stays hidden during cutscenes and subtitles, and until the first load finishes or the position stays still for 3 seconds. Settings start closed. Unstuck appears between the waymark button and the pin while playback is stalled.
+- Clicking the seek bar fast-forwards to that time and continues until it arrives. Dragging the handle does not seek. The speed slider runs from 0.05x to 10x, and the speed buttons stay on the bar.
+
+### Fixed
+
+- Unloading Replay Library during playback pauses the replay and reports that playback will break until the plugin or the replay is loaded again.
+
 ## [0.1.3] - 2026-11-13
 
 ### Changed

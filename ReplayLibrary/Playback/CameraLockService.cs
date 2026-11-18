@@ -78,6 +78,8 @@ internal sealed unsafe class CameraLockService : IDisposable
     private static bool BlockWasd =>
         C.DisableWasdInput && PlaybackService.IsPlaying;
 
+    public void Release() => SetActive(false);
+
     public void Update()
     {
         if (!C.LockCamera)

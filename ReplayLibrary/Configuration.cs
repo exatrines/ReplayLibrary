@@ -68,13 +68,13 @@ public sealed class Configuration : IPluginConfiguration
 
     public float SeekRate { get; set; } = 100f;
 
-    public bool ShowSpeedButtons { get; set; }
-
     public float SpeedPreset { get; set; } = 30f;
 
     public bool ShowWaymarks { get; set; } = true;
 
     public bool PinPlaybackBar { get; set; } = true;
+
+    public string LastLoadedReplay { get; set; } = "";
 
     public bool LockCamera { get; set; }
 

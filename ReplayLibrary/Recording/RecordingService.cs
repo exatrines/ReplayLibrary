@@ -173,7 +173,7 @@ internal sealed unsafe class RecordingService : IDisposable
         return newest;
     }
 
-    private static bool IsRecording()
+    internal static bool IsRecording()
     {
         var manager = ContentsReplayManager.Instance();
         if (manager == null)

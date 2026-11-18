@@ -12,90 +12,259 @@ internal static unsafe class PlaybackReader
     private const int OverallOffset = 0x38;
     private const int DataOffset = 0x30;
     private const int DataLoadTypeOffset = 0x434;
+    private const int ActiveHeaderOffset = 0x48;
     private const int SeekDeltaOffset = 0x728;
-    private const int LoadingOffset = 0x720;
     private const int SelectedChapterOffset = 0x734;
     private const int SlotOffset = 0x458;
+    private const int FileStreamOffset = 0x8;
+    private const int SavedHeadersOffset = 0x5B0;
     private const int SegmentHeader = 12;
 
-    private static byte[]? _bytes;
-    private static GCHandle _handle;
+    private static byte* _block;
     private static uint _dataLength;
     private static string? _pendingPath;
+    private static string? _selectedPath;
+    private static string? _loadedPath;
+    private static bool _courseReady;
     private static uint _seekStop;
     private static byte _quickTarget;
     private static byte _sectionEnd;
-    private static int _loading;
-    private static bool _waymarksApplied;
-    private static float _lastPosition;
-    private static long _movedAt = Environment.TickCount64;
 
-    internal static bool HasBuffer => _bytes != null;
+    internal static bool HasBuffer => _block != null;
 
-    internal static void Watch(string path) => _pendingPath = path;
-
-    internal static void LoadCurrent()
+    internal static void Watch(string path)
     {
-        Clear();
-        var path = _pendingPath;
-        if (string.IsNullOrEmpty(path))
-        {
-            var manager = ContentsReplayManager.Instance();
-            if (manager == null)
-                return;
+        _pendingPath = path;
+        if (Read(path, false))
+            Remember(path);
+    }
 
-            var slot = *((byte*)manager + SlotOffset);
-            if (slot > 2)
-                slot = 0;
-            path = ReplaySlots.PathFor(slot);
-        }
+    internal static void SelectPlayback(string? path) => _selectedPath = path;
 
-        if (!File.Exists(path))
+    internal static void ReloadStartedPlayback(ContentsReplayManager* manager)
+    {
+        var path = string.IsNullOrEmpty(_selectedPath)
+            ? ReplaySlots.PathFor(*((byte*)manager + SlotOffset))
+            : _selectedPath;
+        FreeBlock();
+        LoadFromDisk(path);
+    }
+
+    internal static void ResumeClosedStream()
+    {
+        var manager = ContentsReplayManager.Instance();
+        if (manager == null || !manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.InPlayback))
             return;
 
-        try
-        {
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            if (stream.Length < DataStart + SegmentHeader)
-                return;
+        var stream = *(nint*)((byte*)manager + FileStreamOffset);
+        if (stream == 0 || *(long*)stream != 0)
+            return;
 
-            var bytes = new byte[stream.Length];
-            stream.ReadExactly(bytes);
-            var length = BitConverter.ToUInt32(bytes, ReplayLengthOffset);
-            if (length < SegmentHeader || DataStart + length > bytes.Length)
-                return;
+        if (!string.IsNullOrEmpty(C.LastLoadedReplay))
+            LoadFromDisk(C.LastLoadedReplay);
+    }
 
-            _bytes = bytes;
-            _handle = GCHandle.Alloc(_bytes, GCHandleType.Pinned);
-            _dataLength = length;
-            _waymarksApplied = false;
-        }
-        catch (Exception e)
+    internal static void ReleaseOnUnload()
+    {
+        var manager = ContentsReplayManager.Instance();
+        if (manager != null && manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.InPlayback))
         {
-            PluginServices.Log.Warning(e, "Could not read the playing replay");
-            Clear();
+            manager->PlaybackControls |= ContentsReplayPlaybackControl.Paused;
+            PluginServices.ChatGui.PrintError(LibraryText.Get("playback.unloaded"));
         }
+
+        ApplySavedContentIds(0);
+        FreeBlock();
+        _dataLength = 0;
+        _loadedPath = null;
+        _courseReady = false;
+        _seekStop = 0;
+        _quickTarget = 0;
+        _sectionEnd = 0;
+    }
+
+    internal static void ApplySavedContentIds(ulong contentId)
+    {
+        for (var slot = 0; slot < ReplaySlots.SlotCount; slot++)
+        {
+            var address = SavedHeaderAddress(slot);
+            if (address == 0 || !HeaderValid(address))
+                continue;
+
+            *(ulong*)(address + ReplayFile.LocalContentIdOffset) = contentId;
+        }
+    }
+
+    internal static byte[] ReadSavedHeader(int slot)
+    {
+        var bytes = new byte[ReplayFile.HeaderSize];
+        var address = SavedHeaderAddress(slot);
+        if (address != 0)
+            Marshal.Copy(address, bytes, 0, bytes.Length);
+        return bytes;
+    }
+
+    internal static void WriteSavedHeader(int slot, byte[] header)
+    {
+        var address = SavedHeaderAddress(slot);
+        if (address == 0 || header.Length < ReplayFile.HeaderSize)
+            return;
+
+        Marshal.Copy(header, 0, address, ReplayFile.HeaderSize);
+    }
+
+    internal static void PreparePlayback()
+    {
+        var path = ResolvePath();
+        if (!string.IsNullOrEmpty(path))
+            Read(path, false);
+        if (_block == null || _courseReady)
+            return;
+
+        _seekStop = 0;
+        _quickTarget = 0;
+        _sectionEnd = 0;
+        PlaybackHooks.SetFastForward(false);
+        PlaybackHooks.SetUnlimited(false);
+        PublishHeader();
+        _courseReady = true;
     }
 
     internal static void Clear()
     {
         PlaybackHooks.SetFastForward(false);
         PlaybackHooks.SetUnlimited(false);
-        if (_handle.IsAllocated)
-            _handle.Free();
-        _bytes = null;
+        if (_block != null)
+        {
+            Marshal.FreeHGlobal((nint)_block);
+            _block = null;
+        }
+
         _dataLength = 0;
+        _loadedPath = null;
+        _courseReady = false;
         _seekStop = 0;
         _quickTarget = 0;
         _sectionEnd = 0;
-        _loading = 0;
-        _lastPosition = 0;
-        _movedAt = Environment.TickCount64;
+    }
+
+    private static void PublishHeader()
+    {
+        var manager = ContentsReplayManager.Instance();
+        if (manager == null || _block == null)
+            return;
+
+        Buffer.MemoryCopy(_block, (byte*)manager + ActiveHeaderOffset, DataStart, DataStart);
+        *(int*)((byte*)manager + DataLoadTypeOffset) = 0;
+    }
+
+    private static bool LoadFromDisk(string path)
+    {
+        if (!Read(path, true))
+            return false;
+
+        PublishHeader();
+        _courseReady = true;
+        Remember(path);
+        return true;
+    }
+
+    private static void Remember(string path)
+    {
+        if (string.Equals(C.LastLoadedReplay, path, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        C.LastLoadedReplay = path;
+        C.Save();
+    }
+
+    private static void FreeBlock()
+    {
+        if (_block == null)
+            return;
+
+        Marshal.FreeHGlobal((nint)_block);
+        _block = null;
+        _dataLength = 0;
+        _loadedPath = null;
+        _courseReady = false;
+    }
+
+    private static nint SavedHeaderAddress(int slot)
+    {
+        var manager = ContentsReplayManager.Instance();
+        if (manager == null || slot < 0)
+            return 0;
+
+        var headers = *(nint*)((byte*)manager + SavedHeadersOffset);
+        return headers == 0 ? 0 : headers + slot * ReplayFile.HeaderSize;
+    }
+
+    private static bool HeaderValid(nint address)
+    {
+        var magic = ReplayFile.Magic;
+        for (var i = 0; i < magic.Length; i++)
+        {
+            if (*(byte*)(address + i) != (byte)magic[i])
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool Read(string path, bool replace)
+    {
+        if (!replace && _block != null && string.Equals(_loadedPath, path, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        if (!replace && _block != null && PlaybackService.IsPlaying)
+            return false;
+
+        try
+        {
+            var bytes = File.ReadAllBytes(path);
+            if (bytes.Length < DataStart + SegmentHeader)
+                return false;
+
+            var length = BitConverter.ToUInt32(bytes, ReplayLengthOffset);
+            if (length < SegmentHeader || DataStart + length > bytes.Length)
+                return false;
+
+            var block = (byte*)Marshal.AllocHGlobal(bytes.Length);
+            Marshal.Copy(bytes, 0, (nint)block, bytes.Length);
+            var previous = _block;
+            _dataLength = length;
+            _loadedPath = path;
+            _block = block;
+            if (previous != null)
+                Marshal.FreeHGlobal((nint)previous);
+            return true;
+        }
+        catch (Exception e)
+        {
+            PluginServices.Log.Warning(e, "Could not read the playing replay");
+            return false;
+        }
+    }
+
+    private static string? ResolvePath()
+    {
+        if (!string.IsNullOrEmpty(_pendingPath))
+            return _pendingPath;
+
+        var manager = ContentsReplayManager.Instance();
+        if (manager == null)
+            return null;
+
+        var slot = *((byte*)manager + SlotOffset);
+        if (slot > 2)
+            slot = 0;
+        return ReplaySlots.PathFor(slot);
     }
 
     internal static byte* CurrentSegment(ContentsReplayManager* manager)
     {
-        if (_bytes == null || manager == null)
+        if (_block == null || manager == null)
             return null;
 
         var offset = *(long*)((byte*)manager + OverallOffset);
@@ -116,7 +285,7 @@ internal static unsafe class PlaybackReader
         var delta = *(float*)((byte*)manager + SeekDeltaOffset);
         PlaybackHooks.SetUnlimited(rate > 100f && delta < rate);
 
-        var segment = (byte*)_handle.AddrOfPinnedObject() + DataStart + cursor;
+        var segment = _block + DataStart + cursor;
         var size = *(ushort*)(segment + 2);
         if (cursor + SegmentHeader + size > _dataLength)
             return null;
@@ -126,20 +295,13 @@ internal static unsafe class PlaybackReader
 
     internal static void AfterPlaybackUpdate(ContentsReplayManager* manager)
     {
-        if (manager == null || _bytes == null)
+        if (manager == null || _block == null)
             return;
 
         *(long*)((byte*)manager + DataOffset) = 0;
         *(int*)((byte*)manager + DataLoadTypeOffset) = 0;
-        ApplyWaymarks(manager);
         if (_quickTarget >= 2 && ChapterMs(manager, _sectionEnd) <= SeekMs(manager))
             ContinueQuickLoad(manager);
-    }
-
-    internal static void ArmFastForward()
-    {
-        if (_seekStop != 0)
-            PlaybackHooks.SetFastForward(true);
     }
 
     internal static void OnChapter(ContentsReplayManager* manager, byte chapter)
@@ -159,7 +321,7 @@ internal static unsafe class PlaybackReader
     internal static void Seek(uint ms)
     {
         var manager = ContentsReplayManager.Instance();
-        if (manager == null || _bytes == null || IsLoading(manager))
+        if (manager == null || _block == null || IsLoading(manager))
             return;
 
         if (!TryFind(ms, out var offset, out var segmentMs))
@@ -168,6 +330,7 @@ internal static unsafe class PlaybackReader
         var chapter = ChapterAtTime(manager, ms);
         var current = ChapterAtTime(manager, (uint)Math.Max(SeekMs(manager), 0));
         _seekStop = offset;
+        PlaybackHooks.SetFastForward(true);
         if (SeekMs(manager) < (int)segmentMs && chapter == current)
             PlaybackHooks.RefreshChapter(manager, (byte)chapter);
         else
@@ -177,7 +340,7 @@ internal static unsafe class PlaybackReader
     internal static void Jump(uint ms)
     {
         var manager = ContentsReplayManager.Instance();
-        if (manager == null || _bytes == null || !TryFind(ms, out var offset, out var segmentMs))
+        if (manager == null || _block == null || !TryFind(ms, out var offset, out var segmentMs))
             return;
 
         *(long*)((byte*)manager + OverallOffset) = offset;
@@ -201,8 +364,6 @@ internal static unsafe class PlaybackReader
         if (manager == null)
             return;
 
-        _seekStop = 0;
-        PlaybackHooks.SetFastForward(false);
         *(long*)((byte*)manager + OverallOffset) = long.MaxValue;
     }
 
@@ -215,38 +376,15 @@ internal static unsafe class PlaybackReader
         if (manager == null || manager->NumChapters == 0)
             return false;
 
-        positionMs = SeekMs(manager);
-        var start = ChapterAtTime(manager, (uint)positionMs);
+        positionMs = Math.Max(SeekMs(manager), (int)ChapterMs(manager, 0));
+        var start = ChapterAtTime(manager, (uint)Math.Max(SeekMs(manager), 0));
         start = Previous(manager, start, FFXIVREPLAYChapterType.StartRestart);
         var end = Next(manager, start, FFXIVREPLAYChapterType.StartRestart);
         startMs = (int)ChapterMs(manager, start);
         endMs = end > start ? (int)ChapterMs(manager, end) : (int)manager->Header.TotalMs;
         if (endMs <= startMs)
             endMs = (int)manager->Header.TotalMs;
-        positionMs = Math.Clamp(positionMs, startMs, endMs);
         return endMs > startMs;
-    }
-
-    internal static bool Stalled()
-    {
-        var manager = ContentsReplayManager.Instance();
-        if (manager == null)
-            return false;
-
-        if (*(int*)((byte*)manager + LoadingOffset) != 0)
-            return false;
-
-        var paused = manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.Paused);
-        var position = manager->PositionMs;
-        var now = Environment.TickCount64;
-        if (paused || Math.Abs(position - _lastPosition) > 0.001f)
-        {
-            _lastPosition = position;
-            _movedAt = now;
-            return false;
-        }
-
-        return now - _movedAt > 3000;
     }
 
     internal static bool IsChapterLoading
@@ -271,7 +409,7 @@ internal static unsafe class PlaybackReader
         {
             var countdown = Next(manager, cutscene, FFXIVREPLAYChapterType.Countdown);
             if (countdown == 0 || countdown > cutscene + 2)
-                countdown = Math.Min(cutscene + 2, manager->NumChapters - 1);
+                countdown = cutscene + 2;
             PlaySection(manager, cutscene, countdown);
             return;
         }
@@ -300,24 +438,14 @@ internal static unsafe class PlaybackReader
         manager->PositionMs = chapter.PositionMs / 1000f;
     }
 
-    private static void ApplyWaymarks(ContentsReplayManager* manager)
-    {
-        var loading = *(int*)((byte*)manager + LoadingOffset);
-        if (!_waymarksApplied && _loading != 0 && loading == 0 && !C.ShowWaymarks && PlaybackHooks.WaymarksVisible)
-            PlaybackHooks.ToggleWaymarks();
-        if (loading == 0)
-            _waymarksApplied = true;
-        _loading = loading;
-    }
-
     private static bool TryFind(uint ms, out uint offset, out uint segmentMs)
     {
         offset = 0;
         segmentMs = 0;
-        if (_bytes == null)
+        if (_block == null)
             return false;
 
-        var data = (byte*)_handle.AddrOfPinnedObject() + DataStart;
+        var data = _block + DataStart;
         uint cursor = 0;
         while (cursor + SegmentHeader <= _dataLength)
         {
@@ -341,20 +469,19 @@ internal static unsafe class PlaybackReader
 
     private static int ChapterAtTime(ContentsReplayManager* manager, uint ms)
     {
-        var chapter = 0;
         var count = manager->NumChapters;
-        for (var i = 0; i < count; i++)
+        for (var i = count - 1; i > 0; i--)
         {
             if (manager->Chapters[i].PositionMs <= ms)
-                chapter = i;
+                return i;
         }
 
-        return chapter;
+        return 0;
     }
 
     private static int Previous(ContentsReplayManager* manager, int from, FFXIVREPLAYChapterType type)
     {
-        for (var i = Math.Min(from, manager->NumChapters - 1); i >= 0; i--)
+        for (var i = Math.Min(from, manager->NumChapters - 1); i > 0; i--)
         {
             if (manager->Chapters[i].Type == type)
                 return i;

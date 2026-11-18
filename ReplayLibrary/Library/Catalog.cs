@@ -1,10 +1,10 @@
-using System.Text.Json.Nodes;
 using Lumina.Excel.Sheets;
+using ReplayLibrary.Recording;
 
 namespace ReplayLibrary.Library;
 
-/// <summary>Lists the library, files a finished recording, and applies delete and trim.</summary>
-internal static class Catalog
+/// <summary>Lists the library, files loose replays, and applies delete and trim.</summary>
+internal static partial class Catalog
 {
     internal readonly record struct Entry(
         string ContentTypeName,
@@ -42,7 +42,7 @@ internal static class Catalog
         var entries = new List<Entry>();
         AddLibrary(ReplayPaths.LibraryDirectory(), entries, typeNames);
         Disambiguate(entries);
-        return MarkProtected(PreferBuild(entries, preferredBuild));
+        return MarkProtected(VisibleCopies(entries, preferredBuild));
     }
 
     private static void AddLibrary(string root, List<Entry> entries, Dictionary<uint, string> typeNames)
@@ -173,7 +173,7 @@ internal static class Catalog
         }
     }
 
-    private static List<Entry> PreferBuild(List<Entry> entries, uint preferredBuild)
+    private static List<Entry> VisibleCopies(List<Entry> entries, uint preferredBuild)
     {
         var preferred = preferredBuild.ToString();
         var result = new List<Entry>();
@@ -186,7 +186,9 @@ internal static class Catalog
             }
 
             var current = group.Where(entry => entry.Version == preferred).ToList();
-            result.AddRange(current.Count > 0 ? current : group);
+            var shown = current.Count > 0 ? current : group.ToList();
+            var anonymized = shown.Where(entry => entry.Anonymized).ToList();
+            result.AddRange(anonymized.Count > 0 ? anonymized : shown);
         }
 
         return result;
@@ -256,9 +258,12 @@ internal static class Catalog
         return full.StartsWith(folder + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
-    internal static string? FindOriginal(uint sourceBuild, uint timestamp, uint contentId)
+    internal static string? FindOriginal(uint sourceBuild, uint timestamp, uint contentId) =>
+        FindOriginalIn(ReplayPaths.LibraryDirectory(), sourceBuild, timestamp, contentId)
+        ?? FindOriginalIn(ReplayPaths.DeletedDirectory(), sourceBuild, timestamp, contentId);
+
+    private static string? FindOriginalIn(string folder, uint sourceBuild, uint timestamp, uint contentId)
     {
-        var folder = ReplayPaths.LibraryDirectory();
         if (!Directory.Exists(folder))
             return null;
 
@@ -292,6 +297,96 @@ internal static class Catalog
         return changed;
     }
 
+    internal static int FileLoose()
+    {
+        if (!ReplayBackup.CanMutateReplay() || RecordingService.IsRecording())
+            return 0;
+
+        MigrateLegacy();
+        MigrateLedger();
+        var replay = ReplayPaths.ReplayDirectory();
+        if (!Directory.Exists(replay))
+            return 0;
+
+        Directory.CreateDirectory(ReplayPaths.LibraryDirectory());
+
+        var stored = StoredKeys();
+        var moved = 0;
+        foreach (var file in Directory.EnumerateFiles(replay, "*.dat", SearchOption.AllDirectories).ToList())
+        {
+            if (SkipLoose(file) || !ReplayFile.TryRead(file, out var header))
+                continue;
+
+            var key = (header.GameBuildRevision, header.Timestamp, header.Length);
+            if (stored.TryGetValue(key, out var existing) && existing.Exists(path => SameBytes(file, path)))
+            {
+                TryDeleteSource(file);
+                continue;
+            }
+
+            var destination = NextFreePath(ReplayPaths.LibraryDirectory(), FiledStem(header, file));
+            try
+            {
+                if (!PlaceInLibrary(file, destination))
+                    continue;
+            }
+            catch (Exception e)
+            {
+                PluginServices.Log.Error(e, "Failed to file replay {Path}", file);
+                continue;
+            }
+
+            if (!stored.TryGetValue(key, out existing))
+            {
+                existing = [];
+                stored[key] = existing;
+            }
+
+            existing.Add(destination);
+            moved++;
+        }
+
+        return moved;
+    }
+
+    private static bool SkipLoose(string path) =>
+        ReplayFile.IsLoadFile(path)
+        || IsLegacyPart(path)
+        || IsSplitFile(path)
+        || IsInLibrary(path)
+        || IsInside(path, ReplayPaths.DeletedDirectory())
+        || IsInside(path, ReplayPaths.LegacyDeletedDirectory());
+
+    private static string FiledStem(ReplayFile.Header header, string path)
+    {
+        var mark = ReadFileMark(path);
+        var content = header.ContentFinderConditionId != 0 ? Lookup(header.ContentFinderConditionId).Name : null;
+        if (string.IsNullOrWhiteSpace(content))
+            content = mark.Content;
+        if (string.IsNullOrWhiteSpace(content))
+            content = header.ContentFinderConditionId != 0 ? header.ContentFinderConditionId.ToString() : "content";
+
+        return FileStem(header.Timestamp, content, header.GameBuildRevision, mark.SourceBuild, mark.Anonymized);
+    }
+
+    private static Dictionary<(uint Build, uint Timestamp, long Length), List<string>> StoredKeys()
+    {
+        var stored = new Dictionary<(uint, uint, long), List<string>>();
+        foreach (var file in ReadStored(ReplayPaths.LibraryDirectory()))
+        {
+            var key = (file.Header.GameBuildRevision, file.Header.Timestamp, file.Header.Length);
+            if (!stored.TryGetValue(key, out var paths))
+            {
+                paths = [];
+                stored[key] = paths;
+            }
+
+            paths.Add(file.Path);
+        }
+
+        return stored;
+    }
+
     private static bool Relocate(string source, string destination)
     {
         if (!Directory.Exists(source))
@@ -307,10 +402,21 @@ internal static class Catalog
             var target = NextFreePath(destination, Path.GetFileNameWithoutExtension(file));
             try
             {
-                lock (FileGate)
+                if (IsInLibrary(target))
                 {
-                    File.Move(file, target);
-                    MoveSidecar(file, target, clearDestination: false);
+                    if (!PlaceInLibrary(file, target))
+                        continue;
+                }
+                else
+                {
+                    lock (FileGate)
+                    {
+                        if (!File.Exists(file))
+                            continue;
+
+                        File.Move(file, target);
+                        DeleteSidecar(file);
+                    }
                 }
 
                 moved = true;
@@ -338,25 +444,22 @@ internal static class Catalog
         if (string.IsNullOrWhiteSpace(contentName))
             contentName = "content";
 
-        if (FindIdentical(sourcePath, header) != null)
+        var existing = FindIdentical(sourcePath, header);
+        if (existing != null)
         {
             TryDeleteSource(sourcePath);
-            return null;
+            return existing;
         }
 
+        MigrateLedger();
         var folder = ReplayPaths.LibraryDirectory();
         Directory.CreateDirectory(folder);
         var fileName = FileStem(header.Timestamp, contentName, header.GameBuildRevision);
         var destination = NextFreePath(folder, fileName);
         try
         {
-            lock (FileGate)
-            {
-                File.Move(sourcePath, destination);
-                MoveSidecar(sourcePath, destination, clearDestination: false);
-            }
-
-            ResetDeleteTimer(destination);
+            if (!PlaceInLibrary(sourcePath, destination))
+                return null;
         }
         catch (Exception e)
         {
@@ -375,13 +478,6 @@ internal static class Catalog
 
         if (!ReplayFile.TryRead(sourcePath, out var header))
             return null;
-
-        var stored = FindIdentical(sourcePath, header);
-        if (stored != null)
-        {
-            TryDeleteSource(sourcePath);
-            return stored;
-        }
 
         return Import(sourcePath, header.ContentFinderConditionId, string.Empty);
     }
@@ -515,7 +611,9 @@ internal static class Catalog
         File.Move(path, destination);
         RemoveSplitParts(path);
         File.SetCreationTimeUtc(destination, DateTime.UtcNow);
-        MoveSidecar(path, destination, clearDestination: true);
+        ForgetLibraryEntry(path);
+        DeleteSidecar(path);
+        DeleteSidecar(destination);
         return true;
     }
 
@@ -528,6 +626,7 @@ internal static class Catalog
             removed = true;
         }
 
+        ForgetLibraryEntry(path);
         if (DeleteSidecar(path))
             removed = true;
 
@@ -537,14 +636,28 @@ internal static class Catalog
         return removed;
     }
 
-    private static void MoveSidecar(string source, string destination, bool clearDestination)
+    private static bool PlaceInLibrary(string source, string destination)
+    {
+        lock (FileGate)
+        {
+            if (!File.Exists(source))
+                return false;
+
+            File.Move(source, destination);
+            MoveSidecar(source, destination);
+        }
+
+        NoteLibraryEntry(destination);
+        return true;
+    }
+
+    private static void MoveSidecar(string source, string destination)
     {
         var meta = Path.ChangeExtension(source, ".json");
-        var target = Path.ChangeExtension(destination, ".json");
-        if (File.Exists(meta))
-            File.Move(meta, target, overwrite: true);
-        else if (clearDestination && File.Exists(target))
-            File.Delete(target);
+        if (!File.Exists(meta))
+            return;
+
+        File.Move(meta, Path.ChangeExtension(destination, ".json"), overwrite: true);
     }
 
     private static bool DeleteSidecar(string path)
@@ -576,6 +689,8 @@ internal static class Catalog
             }
             else
             {
+                MigrateLedger();
+                RefreshLibraryLedger();
                 changed = ArchiveAgedReplays(scan.Stored);
                 if (TrimDeleted(scan.Deleted))
                     changed = true;
@@ -668,41 +783,11 @@ internal static class Catalog
         return changed;
     }
 
-    internal static void ResetDeleteTimer(string? path)
-    {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path))
-            return;
-
-        var meta = Path.ChangeExtension(path, ".json");
-        try
-        {
-            var obj = File.Exists(meta) ? JsonNode.Parse(File.ReadAllText(meta)) as JsonObject : null;
-            obj ??= new JsonObject();
-            obj["deleteFrom"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            File.WriteAllText(meta, obj.ToJsonString());
-        }
-        catch (Exception e)
-        {
-            PluginServices.Log.Error(e, "Failed to reset the delete timer {Path}", path);
-        }
-    }
-
     private static long DeleteAnchor(string path, uint recorded)
     {
-        var meta = Path.ChangeExtension(path, ".json");
-        if (!File.Exists(meta))
-            return recorded;
-
-        try
-        {
-            var obj = JsonNode.Parse(File.ReadAllText(meta)) as JsonObject;
-            if (obj?["deleteFrom"] is JsonValue value && value.TryGetValue<long>(out var from) && from > 0)
-                return from;
-        }
-        catch (Exception e)
-        {
-            PluginServices.Log.Error(e, "Failed to read the delete timer {Path}", path);
-        }
+        var entered = LibraryEntered(path);
+        if (entered > 0)
+            return entered;
 
         if (IsInLibrary(path))
             return recorded;
@@ -806,11 +891,13 @@ internal static class Catalog
             if (count <= 0)
                 continue;
 
+            var members = group.ToList();
             var ranked = new List<StoredReplay>();
-            foreach (var file in group)
+            foreach (var file in members)
             {
-                if (ReadFileMark(file.Path).SourceBuild == 0)
-                    ranked.Add(file);
+                if (HasCurrentConversion(file, members) || AnonymizedCopyShown(file, members))
+                    continue;
+                ranked.Add(file);
             }
 
             ranked.Sort(CompareLock);
@@ -820,6 +907,49 @@ internal static class Catalog
         }
 
         return kept;
+    }
+
+    private static bool HasCurrentConversion(StoredReplay file, List<StoredReplay> group)
+    {
+        var sourceBuild = file.Header.GameBuildRevision;
+        if (sourceBuild == 0 || sourceBuild == GameBuild.Current || file.Header.Timestamp == 0)
+            return false;
+
+        foreach (var other in group)
+        {
+            if (other.Header.Timestamp != file.Header.Timestamp)
+                continue;
+            if (other.Header.GameBuildRevision != GameBuild.Current)
+                continue;
+            if (ReadFileMark(other.Path).SourceBuild != sourceBuild)
+                continue;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool AnonymizedCopyShown(StoredReplay file, List<StoredReplay> group)
+    {
+        if (file.Header.Timestamp == 0 || ReadFileMark(file.Path).Anonymized)
+            return false;
+
+        var current = false;
+        var anonymized = false;
+        var currentAnonymized = false;
+        foreach (var other in group)
+        {
+            if (other.Header.Timestamp != file.Header.Timestamp)
+                continue;
+
+            var marked = ReadFileMark(other.Path).Anonymized;
+            var samePatch = other.Header.GameBuildRevision == GameBuild.Current;
+            current |= samePatch;
+            anonymized |= marked;
+            currentAnonymized |= samePatch && marked;
+        }
+
+        return current ? currentAnonymized : anonymized;
     }
 
     private static int CompareLock(StoredReplay left, StoredReplay right)
@@ -897,14 +1027,22 @@ internal static class Catalog
         return files;
     }
 
-    private static string FileStem(uint timestamp, string contentName, uint build)
+    private static string FileStem(uint timestamp, string contentName, uint build) =>
+        FileStem(timestamp, contentName, build, 0, false);
+
+    private static string FileStem(uint timestamp, string contentName, uint build, uint sourceBuild, bool anonymized)
     {
         var stamp = timestamp == 0
             ? DateTime.Now.ToString("yyyyMMddHHmmss")
             : DateTimeOffset.FromUnixTimeSeconds(timestamp).LocalDateTime.ToString("yyyyMMddHHmmss");
         var safe = FileContentName(contentName);
         var stem = string.IsNullOrEmpty(safe) ? stamp : $"{stamp}_{safe}";
-        return stem + "_v" + build;
+        stem += "_v" + build;
+        if (sourceBuild != 0 && sourceBuild != build)
+            stem += "_c" + sourceBuild;
+        if (anonymized)
+            stem += "_a";
+        return stem;
     }
 
     private static string FileContentName(string name)

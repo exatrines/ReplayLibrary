@@ -1,5 +1,6 @@
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface;
+using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using ReplayLibrary.Playback;
 
@@ -14,6 +15,8 @@ internal static unsafe class PlaybackBar
 
     internal static readonly PlaybackWindow Floating = new();
 
+    private const int InitialLoadOffset = 0x720;
+
     private enum Page
     {
         Settings,
@@ -21,21 +24,34 @@ internal static unsafe class PlaybackBar
         Characters,
     }
 
-    private static bool _expanded = true;
+    private static bool _expanded;
     private static Page _page = Page.Settings;
+    private static bool _loadingPlayback;
+    private static bool _loadedPlayback = true;
+    private static bool _showUnstuck;
+    private static bool _unstuckRunning;
+    private static float _lastSeek;
+    private static long _unstuckAt;
     private static Vector2 _endPopupPos;
-    private static bool _seekHold;
-    private static int _seekPreview;
+    private static bool _overlayReady;
+    private static Vector2 _overlayDock;
+    private static float _overlayWidth;
     private static float _topHeight = 48f;
     private static float _footerHeight = 96f;
 
-    internal static void Prepare() =>
-        Floating.IsOpen = !C.PinPlaybackBar && TryDock(out _, out _);
+    internal static void Prepare()
+    {
+        _overlayReady = BeginPlaybackOverlay(out _overlayDock, out _overlayWidth);
+        Floating.IsOpen = _overlayReady && !C.PinPlaybackBar;
+    }
 
     internal static void DrawDocked()
     {
-        if (!C.PinPlaybackBar || !TryDock(out var dock, out var width))
+        if (!_overlayReady || !C.PinPlaybackBar)
             return;
+
+        var dock = _overlayDock;
+        var width = _overlayWidth;
 
         var colors = MirageTheme.ResolveAppliedColors();
         var height = PageHeight();
@@ -61,6 +77,71 @@ internal static unsafe class PlaybackBar
             ImGui.End();
             ImGui.PopStyleColor();
         }
+    }
+
+    private static bool BeginPlaybackOverlay(out Vector2 dock, out float width)
+    {
+        dock = default;
+        width = 0f;
+        if (PluginServices.GameGui.GameUiHidden || PluginServices.Condition[ConditionFlag.WatchingCutscene])
+            return false;
+
+        var manager = ContentsReplayManager.Instance();
+        var playing = manager != null && manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.InPlayback);
+        if (!playing)
+        {
+            if (!_loadingPlayback && !_loadedPlayback)
+                return false;
+
+            _loadingPlayback = false;
+            _loadedPlayback = false;
+            return false;
+        }
+
+        if (PluginServices.GameGui.GetAddonByName("TalkSubtitle", 1).Address != 0)
+            return false;
+
+        var seek = manager->PositionMs;
+        var paused = manager->PlaybackControls.HasFlag(ContentsReplayPlaybackControl.Paused);
+        if (seek != _lastSeek || paused)
+        {
+            _lastSeek = seek;
+            _unstuckAt = Environment.TickCount64;
+            _unstuckRunning = true;
+            _showUnstuck = false;
+        }
+        else if (_unstuckRunning && Environment.TickCount64 - _unstuckAt > 3000)
+        {
+            _showUnstuck = true;
+            _loadedPlayback = true;
+        }
+
+        if (!_loadedPlayback)
+        {
+            var loading = *(int*)((byte*)manager + InitialLoadOffset);
+            if (loading != 0)
+            {
+                _loadingPlayback = true;
+            }
+            else if (_loadingPlayback)
+            {
+                _loadedPlayback = true;
+                if (!C.ShowWaymarks && PlaybackHooks.WaymarksVisible)
+                    PlaybackHooks.ToggleWaymarks();
+            }
+
+            return false;
+        }
+
+        var addon = (AtkUnitBase*)PluginServices.GameGui.GetAddonByName("ContentsReplayPlayer", 1).Address;
+        if (addon == null || addon->RootNode == null)
+            return false;
+
+        var scale = addon->Scale;
+        var pad = scale * 8f;
+        width = MathF.Max(1f, addon->RootNode->GetWidth() * scale - pad * 2f);
+        dock = new Vector2(addon->X + pad, addon->Y + pad) + ImGui.GetMainViewport().Pos;
+        return true;
     }
 
     internal static float PageHeight()
@@ -89,7 +170,7 @@ internal static unsafe class PlaybackBar
             ImGuiWindowFlags.AlwaysUseWindowPadding
             | ImGuiWindowFlags.NoScrollbar
             | ImGuiWindowFlags.NoScrollWithMouse);
-        DrawBody(PlaybackReader.Stalled());
+        DrawBody(_showUnstuck);
         ImGui.EndChild();
         ImGui.PopStyleVar();
     }
@@ -116,29 +197,22 @@ internal static unsafe class PlaybackBar
     {
         var origin = ImGui.GetCursorPos();
         var button = MirageUi.ResolveControlHeight();
-        var gap = ImGui.GetStyle().ItemSpacing.X;
         var width = ImGui.GetContentRegionAvail().X;
         var pane = _expanded
             ? MathF.Max(1f, ImGui.GetContentRegionAvail().Y - _footerHeight - _topHeight)
             : 0f;
-        var top = DrawTopBar(button);
+        var top = DrawTopBar(button, stalled);
         _topHeight = top;
 
         if (_expanded)
-            DrawSettingsPane(origin, top, button, gap, width, pane, stalled);
+            DrawSettingsPane(origin, top, button, width, pane);
 
         DrawFooter(new Vector2(origin.X, origin.Y + top + pane));
     }
 
-    private static void DrawSettingsPane(
-        Vector2 origin,
-        float top,
-        float button,
-        float gap,
-        float width,
-        float pane,
-        bool stalled)
+    private static void DrawSettingsPane(Vector2 origin, float top, float button, float width, float pane)
     {
+        var gap = ImGui.GetStyle().ItemSpacing.X;
         const float line = 1f;
         var contentX = origin.X + button + gap + line + gap;
         ImGui.SetCursorPos(new Vector2(origin.X + button + gap, origin.Y + top));
@@ -150,7 +224,8 @@ internal static unsafe class PlaybackBar
             "##playback-main",
             new Vector2(MathF.Max(1f, width - (contentX - origin.X)), pane),
             false);
-        DrawMain(stalled);
+        if (!PlaybackReader.IsChapterLoading)
+            DrawPage();
         ImGui.EndChild();
         ImGui.PopStyleVar();
 
@@ -158,66 +233,20 @@ internal static unsafe class PlaybackBar
         DrawRail();
     }
 
-    private static void DrawFooter(Vector2 cursor)
+    private static void DrawPage()
     {
-        ImGui.SetCursorPos(cursor);
-        var y = ImGui.GetCursorPosY();
-        if (_expanded)
-            MirageUi.PaddedSeparator();
-        DrawTime();
-        DrawSpeed();
-        _footerHeight = MathF.Max(1f, ImGui.GetCursorPosY() - y);
-    }
-
-    private static float DrawTopBar(float button)
-    {
-        var start = ImGui.GetCursorPosY();
-        var spacing = ImGui.GetStyle().ItemSpacing.X;
-        if (TopButton(FontAwesomeIcon.Cog, "playback-gear", _expanded ? "Hide settings" : "Show settings", _expanded))
-            _expanded = !_expanded;
-        ImGui.SameLine(0f, spacing);
-        DrawVerticalSeparator(button);
-        ImGui.SameLine(0f, spacing);
-        if (TopButton(FontAwesomeIcon.Users, "playback-gpose", "Group pose"))
-            PlaybackHooks.EnterGroupPose();
-        ImGui.SameLine();
-        if (TopButton(FontAwesomeIcon.Crosshairs, "playback-idle", "Idle camera on the focus target"))
-            PlaybackHooks.EnterIdleCamera();
-        ImGui.SameLine();
-        DrawWaymarks();
-
-        var endX = ImGui.GetContentRegionMax().X - button * 2f - spacing;
-        ImGui.SameLine(MathF.Max(ImGui.GetCursorPosX(), endX));
-        DrawPin();
-        ImGui.SameLine();
-        if (TopButton(FontAwesomeIcon.FastForward, "playback-end", "Skip to the end"))
-            ImGui.OpenPopup(EndPopup);
-        _endPopupPos = new Vector2(ImGui.GetItemRectMax().X, ImGui.GetItemRectMin().Y);
-        DrawEndPopup();
-        DrawFullSeparator();
-        return MathF.Max(1f, ImGui.GetCursorPosY() - start);
-    }
-
-    private static void DrawMain(bool stalled)
-    {
-        if (!PlaybackReader.IsChapterLoading)
+        switch (_page)
         {
-            switch (_page)
-            {
-                case Page.Camera:
-                    CameraLockPanel.Draw();
-                    break;
-                case Page.Characters:
-                    EntityOverlayPanel.Draw();
-                    break;
-                default:
-                    DrawSettings();
-                    break;
-            }
+            case Page.Camera:
+                CameraLockPanel.Draw();
+                break;
+            case Page.Characters:
+                EntityOverlayPanel.Draw();
+                break;
+            default:
+                DrawSettings();
+                break;
         }
-
-        if (stalled && MirageUi.PrimaryButton("Unstuck", id: "playback-unstuck"))
-            PlaybackReader.SkipPacket();
     }
 
     private static void DrawRail()
@@ -236,6 +265,52 @@ internal static unsafe class PlaybackBar
                 LibraryText.Get("overlay.title"),
                 _page == Page.Characters))
             _page = Page.Characters;
+    }
+
+    private static void DrawFooter(Vector2 cursor)
+    {
+        ImGui.SetCursorPos(cursor);
+        var y = ImGui.GetCursorPosY();
+        if (_expanded)
+            MirageUi.PaddedSeparator();
+        DrawTime();
+        DrawSpeed();
+        _footerHeight = MathF.Max(1f, ImGui.GetCursorPosY() - y);
+    }
+
+    private static float DrawTopBar(float button, bool stalled)
+    {
+        var start = ImGui.GetCursorPosY();
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        if (TopButton(FontAwesomeIcon.Cog, "playback-gear", _expanded ? "Hide settings" : "Show settings", _expanded))
+            _expanded = !_expanded;
+        ImGui.SameLine(0f, spacing);
+        DrawVerticalSeparator(button);
+        ImGui.SameLine(0f, spacing);
+        if (TopButton(FontAwesomeIcon.Users, "playback-gpose", "Group pose"))
+            PlaybackHooks.EnterGroupPose();
+        ImGui.SameLine();
+        if (TopButton(FontAwesomeIcon.Crosshairs, "playback-idle", "Idle camera on the focus target"))
+            PlaybackHooks.EnterIdleCamera();
+        ImGui.SameLine();
+        DrawWaymarks();
+        if (stalled)
+        {
+            ImGui.SameLine();
+            if (ImGui.Button("UNSTUCK"))
+                PlaybackReader.SkipPacket();
+        }
+
+        var endX = ImGui.GetContentRegionMax().X - button * 2f - spacing;
+        ImGui.SameLine(MathF.Max(ImGui.GetCursorPosX(), endX));
+        DrawPin();
+        ImGui.SameLine();
+        if (TopButton(FontAwesomeIcon.FastForward, "playback-end", "Skip to the end"))
+            ImGui.OpenPopup(EndPopup);
+        _endPopupPos = new Vector2(ImGui.GetItemRectMax().X, ImGui.GetItemRectMin().Y);
+        DrawEndPopup();
+        DrawFullSeparator();
+        return MathF.Max(1f, ImGui.GetCursorPosY() - start);
     }
 
     private static void DrawWaymarks()
@@ -367,13 +442,6 @@ internal static unsafe class PlaybackBar
 
         MirageUi.Tooltip("Raising this can break fights that change the arena.");
 
-        var showSpeeds = C.ShowSpeedButtons;
-        if (MirageUi.Checkbox("Show speed buttons", ref showSpeeds))
-        {
-            C.ShowSpeedButtons = showSpeeds;
-            C.Save();
-        }
-
         var preset = C.SpeedPreset;
         if (MirageUi.DragFloat("Speed preset", ref preset, speed: 0.05f, min: 0.05f, max: 60f, format: "%.2f", id: "speed-preset"))
         {
@@ -387,30 +455,29 @@ internal static unsafe class PlaybackBar
         if (!PlaybackReader.TryPull(out var start, out var end, out var position))
             return;
 
-        var max = Math.Max(start + 1, end - RestartDelayMs);
-        var shown = _seekHold ? _seekPreview : Math.Clamp(position, start, max);
-        var label = Clock(shown - start);
+        var label = Clock(Math.Max(0, position - start));
+        var max = end - RestartDelayMs;
+        if (max < start)
+            max = start;
+        var shown = position;
         ImGui.BeginDisabled(PlaybackReader.IsChapterLoading);
-        if (MirageUi.SliderInt("", ref shown, start, max, id: "playback-time", format: label))
-        {
-            _seekHold = true;
-            _seekPreview = shown;
-        }
-
-        if (ImGui.IsItemDeactivated() && _seekHold)
-        {
-            PlaybackReader.Seek((uint)_seekPreview);
-            _seekHold = false;
-        }
-
+        ImGui.PushStyleVar(ImGuiStyleVar.GrabMinSize, 4f);
+        MirageUi.SliderInt("", ref shown, start, max, id: "playback-time-" + start, format: label);
+        ImGui.PopStyleVar();
         if (ImGui.IsItemHovered())
         {
-            var bar = Math.Max(1f, ImGui.GetItemRectSize().X);
-            var ratio = Math.Clamp((ImGui.GetMousePos().X - ImGui.GetItemRectMin().X) / bar, 0f, 1f);
-            var ms = start + (int)((max - start) * ratio);
-            ImGui.SetTooltip(Clock(ms - start));
-            if (C.JumpToTime && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
-                PlaybackReader.Jump((uint)ms);
+            var width = Math.Max(1f, ImGui.GetItemRectSize().X);
+            var ratio = (ImGui.GetMousePos().X - ImGui.GetItemRectMin().X) / width;
+            if (ratio is >= 0f and <= 1f)
+            {
+                var span = Math.Max(0, end - start);
+                var hovered = (int)Math.Min(Math.Max((span - RestartDelayMs) * ratio, 0), span);
+                ImGui.SetTooltip(Clock(hovered));
+                if (ImGui.IsMouseClicked(ImGuiMouseButton.Left))
+                    PlaybackReader.Seek((uint)(start + hovered));
+                else if (C.JumpToTime && ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+                    PlaybackReader.Jump((uint)(start + hovered));
+            }
         }
 
         ImGui.EndDisabled();
@@ -419,13 +486,10 @@ internal static unsafe class PlaybackBar
     private static void DrawSpeed()
     {
         var speed = PlaybackService.PlaybackSpeed;
-        var shown = speed;
-        if (MirageUi.DragFloat("", ref shown, speed: 0.05f, min: 0.05f, max: 60f, format: "%.2fx", id: "playback-speed")
+        var shown = Math.Clamp(speed, 0.05f, 10f);
+        if (MirageUi.SliderFloat("", ref shown, 0.05f, 10f, "%.2fx", id: "playback-speed")
             && Math.Abs(shown - speed) > 0.001f)
             PlaybackService.SetSpeed(shown);
-
-        if (!C.ShowSpeedButtons)
-            return;
 
         var count = Presets.Length + 1;
         var spacing = ImGui.GetStyle().ItemSpacing.X;

@@ -25,6 +25,7 @@ internal sealed partial class MainWindow
     private bool _libraryExpanded;
     private readonly HashSet<uint> _libraryOpenGroups = [];
     private readonly Dictionary<uint, string> _libraryPatchKeys = [];
+    private int _libraryFiling;
 
     private readonly record struct LibraryListRow(bool Header, uint GroupId, int Count, Catalog.Entry Entry);
 
@@ -99,7 +100,33 @@ internal sealed partial class MainWindow
             OpenLibraryFolder();
         ImGui.SameLine(0f, gap);
         if (MirageUi.IconButton(FontAwesomeIcon.Sync, id: "library-refresh", tooltip: "Refresh"))
-            Refresh();
+            FileLibrary();
+    }
+
+    private void FileLibrary()
+    {
+        if (Interlocked.CompareExchange(ref _libraryFiling, 1, 0) != 0)
+            return;
+
+        _ = Task.Run(() =>
+        {
+            var moved = 0;
+            try
+            {
+                moved = Catalog.FileLoose();
+            }
+            finally
+            {
+                var count = moved;
+                Interlocked.Exchange(ref _libraryFiling, 0);
+                PluginServices.Framework.RunOnFrameworkThread(() =>
+                {
+                    Refresh();
+                    if (count > 0)
+                        PluginServices.ChatGui.Print(LibraryText.Format("library.filed", count));
+                });
+            }
+        });
     }
 
     private void DrawLibrarySort()
@@ -1212,8 +1239,7 @@ internal sealed partial class MainWindow
 
     private static string RowJobText(string path)
     {
-        var phase = ReplayConvertClient.PhaseFor(path);
-        return phase.Length == 0 ? "" : LibraryText.Get("card.row." + phase);
+        return ReplayConvertClient.PhaseFor(path).Length == 0 ? "" : LibraryText.Get("card.row.busy");
     }
 
     private string GroupJobText(uint contentId)
@@ -1405,9 +1431,7 @@ internal sealed partial class MainWindow
 
     private void FinishConvert(string source, string? output, string report)
     {
-        Catalog.ResetDeleteTimer(source);
-        if (output != null)
-            Catalog.ResetDeleteTimer(output);
+        Catalog.CopyEntered(source, output);
 
         if (output == null)
         {

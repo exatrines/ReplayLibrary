@@ -23,7 +23,7 @@
 
 Replay Library records duty replays and files each one by content.
 
-A finished recording goes to `replay/replaylibrary`. Play a current-patch replay from an inn. When Replay Converter is loaded, a replay can be converted to the current patch or anonymized. Those buttons stay disabled until Replay Converter is signed in. Opening Replay Converter files loose replays into `replay/replaylibrary`.
+A finished recording goes to `replay/replaylibrary`. Play a current-patch replay from an inn. When Replay Converter is loaded, a replay can be converted to the current patch or anonymized. Those buttons stay disabled until Replay Converter is signed in. The library refresh button files loose replays into `replay/replaylibrary`.
 
 The first launch copies the whole `replay` folder to `replay-backup-yyyyMMdd-HHmmss` before it moves anything. That copy is kept.
 
@@ -42,8 +42,8 @@ https://raw.githubusercontent.com/exatrines/DalamudPlugins/refs/heads/main/plugi
 
 - **Library** — Browse saved replays, filter them, and play a current-patch replay from an inn
 - **Recording** — Record checked content types into `replay/replaylibrary`
-- **Auto-lock** — Lock a set number per content. Unconverted replays come first: current-patch clears, then older-patch clears, then uncleared. Converted replays are not locked
-- **Auto-delete** — Move unlocked replays to Deleted after the set number of days, then trim that folder by size
+- **Auto-lock** — Lock a set number per content. Current-patch clears, then older-patch clears, then uncleared, newest first. A source replay is not locked when its current-patch conversion is in the library. An original is not locked when the anonymized replay is the one shown
+- **Auto-delete** — Move unlocked replays to Deleted after they have been in the library for the set number of days, then trim that folder by size
 - **Convert and anonymize** — Shown when Replay Converter is loaded. Disabled until that plugin is signed in
 - **Language and themes** — English or Japanese, and window themes
 
