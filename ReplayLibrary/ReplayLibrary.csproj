@@ -4,7 +4,7 @@
 
     <PropertyGroup>
         <Authors>mirage</Authors>
-        <Version>0.1.4</Version>
+        <Version>0.1.5</Version>
         <Description>Record content replays and keep them in per-content folders.</Description>
         <PackageLicenseFile>LICENSE</PackageLicenseFile>
     </PropertyGroup>
