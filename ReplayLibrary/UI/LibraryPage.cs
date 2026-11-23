@@ -828,10 +828,7 @@ internal sealed partial class MainWindow
 
     private static void DrawLibraryExpansionIcon(uint exVersion, Vector2 min, Vector2 max, bool muted = false)
     {
-        var directory = PluginServices.PluginInterface.AssemblyLocation.DirectoryName;
-        if (exVersion <= 5
-            && !string.IsNullOrEmpty(directory)
-            && MirageUi.TryGetTexture(Path.Combine(directory, "Assets", "patch.png"), out var texture))
+        if (exVersion <= 5 && MirageUi.TryGetExpansionIcons(out var texture))
         {
             var insetX = 0.5f / texture.Width;
             var insetY = 0.5f / texture.Height;
